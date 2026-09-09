@@ -1,0 +1,145 @@
+{
+  "entities": {
+    "TraderWallet": {
+      "title": "Trader Wallet",
+      "description": "Monitored Solana trader wallet added by user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "address": { "type": "string" },
+        "name": { "type": "string" },
+        "tags": { "type": "array" },
+        "enabled": { "type": "boolean" },
+        "addedAt": { "type": "number" },
+        "color": { "type": "string" },
+        "minSolThreshold": { "type": "number" },
+        "minUsdThreshold": { "type": "number" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "address", "name"]
+    },
+    "AppSettings": {
+      "title": "App Settings",
+      "description": "Application settings and node configuration",
+      "type": "object",
+      "properties": {
+        "rpcUrl": { "type": "string" },
+        "laserstreamApiKey": { "type": "string" },
+        "laserstreamEndpoint": { "type": "string" },
+        "minTradeAlertValueUsd": { "type": "number" },
+        "webhookUrl": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["rpcUrl"]
+    },
+    "CopyTradeSettings": {
+      "title": "Copy Trade Settings",
+      "description": "Paper copy-trading engine settings",
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "fixedSolAmountPerTrade": { "type": "number" },
+        "simulatedSlippageBps": { "type": "number" },
+        "startingVirtualSolBalance": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["enabled", "fixedSolAmountPerTrade"]
+    },
+    "PaperAccount": {
+      "title": "Paper Account",
+      "description": "Virtual Solana trading account",
+      "type": "object",
+      "properties": {
+        "virtualSolBalance": { "type": "number" },
+        "startingVirtualSolBalance": { "type": "number" },
+        "totalRealizedPnlSol": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["virtualSolBalance", "startingVirtualSolBalance"]
+    },
+    "PaperTrade": {
+      "title": "Paper Trade",
+      "description": "Executed paper copy-trade record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sourceWalletAddress": { "type": "string" },
+        "traderName": { "type": "string" },
+        "sourceSignature": { "type": "string" },
+        "tokenMint": { "type": "string" },
+        "tokenSymbol": { "type": "string" },
+        "action": { "type": "string" },
+        "tokenAmount": { "type": "number" },
+        "solAmount": { "type": "number" },
+        "executionPriceSol": { "type": "number" },
+        "mirrorRatio": { "type": "number" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["id", "action", "tokenSymbol", "solAmount"]
+    },
+    "PaperPosition": {
+      "title": "Paper Position",
+      "description": "Open or closed paper position",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sourceWalletAddress": { "type": "string" },
+        "traderName": { "type": "string" },
+        "tokenMint": { "type": "string" },
+        "tokenSymbol": { "type": "string" },
+        "quantity": { "type": "number" },
+        "costBasisSol": { "type": "number" },
+        "avgEntryPriceSol": { "type": "number" },
+        "currentPriceSol": { "type": "number" },
+        "realizedPnlSol": { "type": "number" },
+        "unrealizedPnlSol": { "type": "number" },
+        "status": { "type": "string" }
+      },
+      "required": ["id", "tokenMint", "status"]
+    },
+    "UserEntry": {
+      "title": "User Entry",
+      "description": "Real-time audit log of all user inputs and modifications",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "title": { "type": "string" },
+        "details": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "type", "title", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/wallets/{walletId}": {
+      "schema": "TraderWallet",
+      "description": "User monitored Solana trader wallets"
+    },
+    "/settings/{settingsId}": {
+      "schema": "AppSettings",
+      "description": "User app and connection settings"
+    },
+    "/copyTradeSettings/{configId}": {
+      "schema": "CopyTradeSettings",
+      "description": "User paper copy trading parameters"
+    },
+    "/paperAccount/{accountId}": {
+      "schema": "PaperAccount",
+      "description": "User virtual SOL balance and trading performance"
+    },
+    "/paperTrades/{tradeId}": {
+      "schema": "PaperTrade",
+      "description": "Executed simulated paper trades"
+    },
+    "/paperPositions/{positionId}": {
+      "schema": "PaperPosition",
+      "description": "Open and closed user positions"
+    },
+    "/userEntries/{entryId}": {
+      "schema": "UserEntry",
+      "description": "Real-time stream of all user entries, updates, and activities"
+    }
+  }
+}
