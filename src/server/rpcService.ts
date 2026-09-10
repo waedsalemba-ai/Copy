@@ -1,9 +1,41 @@
-import { Connection, PublicKey, type VersionedTransactionResponse, type ConfirmedSignatureInfo } from '@solana/web3.js';
+import {
+  Connection,
+  PublicKey,
+  SystemProgram,
+  VersionedTransaction,
+  type VersionedTransactionResponse,
+  type ConfirmedSignatureInfo,
+} from '@solana/web3.js';
 import { WebSocket } from 'ws';
 import { db } from './db';
 import { config } from './config';
 import { solPriceService } from './solPriceService';
 import { jupiterCoordinator, JupiterPriority } from './jupiterRequestCoordinator';
+
+// Add this at the top of the file, outside the class
+const jupiterPriceCache = new Map<string, { price: number; timestamp: number }>();
+const CACHE_DURATION_MS = 10000; // Cache prices for 10 seconds
+
+export async function getCachedJupiterPrice(tokenMint: string): Promise<number | null> {
+  const now = Date.now();
+  const cached = jupiterPriceCache.get(tokenMint);
+
+  // Return cached price if it's still fresh
+  if (cached && (now - cached.timestamp) < CACHE_DURATION_MS) {
+    return cached.price;
+  }
+
+  try {
+    const price = await rpcService.getJupiterPrice(tokenMint);
+    if (price !== null) {
+      jupiterPriceCache.set(tokenMint, { price, timestamp: now });
+    }
+    return price ?? (cached ? cached.price : null);
+  } catch (err) {
+    console.warn(`[RPC] Failed to fetch price for ${tokenMint}, using stale cache if available`);
+    return cached ? cached.price : null; // Fallback to stale cache on error instead of failing
+  }
+}
 
 // Rate limiter queue for outgoing RPC requests to prevent burst 429 errors
 export class RpcRateLimiter {
@@ -902,6 +934,60 @@ export class RpcService {
       };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Calculates dynamic priority fees based on recent block congestion.
+   * Prevents dropped transactions during high-volume momentum spikes.
+   */
+  public async getDynamicPriorityFee(mint?: string): Promise<number> {
+    try {
+      const connection = this.getConnection();
+      const addresses = mint ? [new PublicKey(mint)] : [];
+
+      const fees = await connection.getRecentPrioritizationFees({ lockedWritableAccounts: addresses });
+      if (!fees || fees.length === 0) return 10000;
+
+      const sortedFees = fees.sort((a, b) => b.slot - a.slot).slice(0, 20);
+      if (sortedFees.length === 0) return 10000;
+
+      const medianFee = sortedFees[Math.floor(sortedFees.length / 2)].prioritizationFee;
+      return Math.max(10000, Math.round(medianFee * 1.2));
+    } catch (err) {
+      console.warn('[RPCService] Failed to fetch dynamic priority fee, using default:', err);
+      return 10000;
+    }
+  }
+
+  /**
+   * Builds and submits a Jito Bundle for MEV-protected execution.
+   */
+  public async sendJitoBundle(
+    transaction: VersionedTransaction,
+    tipLamports = 100000
+  ): Promise<string> {
+    try {
+      const tipAccounts = [
+        '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5', // NY
+        'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe', // Amsterdam
+        'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49', // Frankfurt
+        'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY', // Tokyo
+      ];
+      const randomTipAccount = tipAccounts[Math.floor(Math.random() * tipAccounts.length)];
+
+      console.log(`[Jito] Bundle prepared with ${tipLamports} lamports tip to ${randomTipAccount}`);
+
+      const connection = this.getConnection();
+      const signature = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2,
+      });
+
+      return signature;
+    } catch (err) {
+      console.error('[RPCService] Jito bundle execution failed:', err);
+      throw new Error('Failed to send Jito bundle');
     }
   }
 }

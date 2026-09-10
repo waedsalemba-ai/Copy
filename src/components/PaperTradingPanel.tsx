@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { PaperAccount, PaperPosition, PaperTrade, CopyTradeSettings, BuyEntrySettings, BuyEntryVerdict } from '../types';
 import { formatTokenQuantity, formatSol } from '../utils/formatters';
+import { EquityCurveChart } from './EquityCurveChart';
 
 interface PaperAccountResponse extends PaperAccount {
   openPositionsValueSol: number;
@@ -96,8 +97,9 @@ export const PaperTradingPanel: React.FC = () => {
 
   useEffect(() => {
     fetchPaperData();
-    // FIX #11: Removed aggressive 3-second polling to prevent server overload.
-    // UI updates are now handled via WebSocket events broadcasted from App.tsx.
+    // FIX: Increased to 15 seconds to prevent 429 Rate Limits on Jupiter/RPC
+    const interval = setInterval(fetchPaperData, 15000);
+    return () => clearInterval(interval);
   }, []);
 
   const postWithRetry = async (url: string, options: RequestInit = {}, retries = 1): Promise<Response> => {
@@ -376,6 +378,13 @@ export const PaperTradingPanel: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Equity Curve Chart */}
+      <EquityCurveChart
+        positions={positions}
+        trades={trades}
+        startingBalance={settings?.startingVirtualSolBalance || account?.startingVirtualSolBalance || 10}
+      />
 
       {/* Copy Trade Settings Card */}
       <div className="rounded bg-[#18181b] border border-[#27272a] p-3">
@@ -942,7 +951,7 @@ export const PaperTradingPanel: React.FC = () => {
                         }`}>
                           {t.solAmount.toFixed(3)}
                         </td>
-                        <td className="py-1.5 px-1.5 text-right text-[#71717a]">
+                        <td className="py-1.5 px-1.5 text-[#71717a] text-right">
                           {typeof entryPrice === 'number'
                             ? entryPrice < 0.0001
                               ? entryPrice.toExponential(2)

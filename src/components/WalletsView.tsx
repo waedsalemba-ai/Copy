@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Plus,
   Search,
@@ -9,8 +9,13 @@ import {
   X,
   ExternalLink,
   AlertCircle,
+  Compass,
+  Sparkles,
+  RefreshCw,
+  TrendingUp,
+  ShieldAlert,
 } from 'lucide-react';
-import { TraderWallet, Position, CanonicalTradeEvent } from '../types';
+import { TraderWallet, Position, CanonicalTradeEvent, DiscoveredWallet } from '../types';
 import { formatAddress, formatSol } from '../utils/formatters';
 
 interface WalletsViewProps {
@@ -34,6 +39,56 @@ export const WalletsView: React.FC<WalletsViewProps> = ({
   const [selectedGroup, setSelectedGroup] = useState('ALL');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [selectedTrader, setSelectedTrader] = useState<TraderWallet | null>(null);
+
+  // Smart Wallet Discovery State
+  const [discoveredWallets, setDiscoveredWallets] = useState<DiscoveredWallet[]>([]);
+  const [isScanningDiscovery, setIsScanningDiscovery] = useState(false);
+  const [showDiscovery, setShowDiscovery] = useState(true);
+
+  const fetchDiscovery = async () => {
+    try {
+      const res = await fetch('/api/discovery');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) setDiscoveredWallets(data);
+      }
+    } catch {
+      // Ignore network errors gracefully
+    }
+  };
+
+  const handleRunDiscoveryScan = async () => {
+    setIsScanningDiscovery(true);
+    try {
+      const res = await fetch('/api/discovery/scan', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.wallets) setDiscoveredWallets(data.wallets);
+      }
+    } catch (err) {
+      console.error('Failed to run discovery scan', err);
+    } finally {
+      setIsScanningDiscovery(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchDiscovery();
+  }, []);
+
+  const handleAddDiscovered = async (w: DiscoveredWallet) => {
+    try {
+      await onAddWallet({
+        address: w.address,
+        traderName: w.traderName,
+        description: `Discovered Smart Money (${w.winRatePercent}% Win Rate)`,
+        group: 'Smart Money',
+        priority: 'HIGH',
+      });
+    } catch (err: any) {
+      alert(err?.message || 'Failed to add discovered wallet.');
+    }
+  };
 
   // Form State
   const [addressInput, setAddressInput] = useState('');
@@ -84,6 +139,106 @@ export const WalletsView: React.FC<WalletsViewProps> = ({
 
   return (
     <div className="space-y-4 font-mono">
+      {/* Smart Wallet Discovery Scanner */}
+      <div className="bg-[#18181b] border border-[#27272a] rounded p-3 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#27272a] pb-2">
+          <div className="flex items-center gap-2">
+            <Compass className="w-4 h-4 text-[#3b82f6]" />
+            <h2 className="text-xs font-bold text-[#fafafa] uppercase tracking-wider flex items-center gap-1.5">
+              SMART WALLET DISCOVERY SCANNER
+              <span className="px-1.5 py-0.5 text-[9px] bg-[#3b82f6]/15 text-[#3b82f6] rounded border border-[#3b82f6]/30">
+                AUTO-SCAN
+              </span>
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleRunDiscoveryScan}
+              disabled={isScanningDiscovery}
+              className="flex items-center gap-1 px-2 py-1 rounded bg-[#09090b] border border-[#27272a] hover:border-[#3b82f6] text-[#fafafa] text-[10px] font-bold transition-all disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${isScanningDiscovery ? 'animate-spin text-[#3b82f6]' : ''}`} />
+              {isScanningDiscovery ? 'Scanning DexScreener...' : 'Run Discovery Scan'}
+            </button>
+            <button
+              onClick={() => setShowDiscovery(!showDiscovery)}
+              className="text-[10px] text-[#71717a] hover:text-[#fafafa] underline"
+            >
+              {showDiscovery ? 'Hide' : 'Show'} ({discoveredWallets.length})
+            </button>
+          </div>
+        </div>
+
+        {showDiscovery && (
+          <div className="overflow-x-auto">
+            {discoveredWallets.length === 0 ? (
+              <div className="p-4 text-center text-[#71717a] text-[11px]">
+                No discovered wallets cached yet. Click "Run Discovery Scan" to search DexScreener momentum leaders.
+              </div>
+            ) : (
+              <table className="w-full text-left text-[11px] border-collapse">
+                <thead>
+                  <tr className="border-b border-[#27272a] text-[#71717a] uppercase text-[9px]">
+                    <th className="py-1.5 px-2">Trader Name</th>
+                    <th className="py-1.5 px-2">Address</th>
+                    <th className="py-1.5 px-2">Win Rate</th>
+                    <th className="py-1.5 px-2">Total Trades</th>
+                    <th className="py-1.5 px-2">Risk Score</th>
+                    <th className="py-1.5 px-2">Recent P&L</th>
+                    <th className="py-1.5 px-2 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#27272a]/50">
+                  {discoveredWallets.map((dw) => {
+                    const isAlreadyAdded = wallets.some(
+                      (w) => w.address.toLowerCase() === dw.address.toLowerCase()
+                    );
+                    return (
+                      <tr key={dw.address} className="hover:bg-[#09090b]/50 transition-colors">
+                        <td className="py-1.5 px-2 font-bold text-[#fafafa]">
+                          <div className="flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-[#f59e0b]" />
+                            {dw.traderName}
+                          </div>
+                        </td>
+                        <td className="py-1.5 px-2 text-[#71717a] font-mono">{formatAddress(dw.address)}</td>
+                        <td className="py-1.5 px-2 text-[#00FF88] font-bold">{dw.winRatePercent}%</td>
+                        <td className="py-1.5 px-2 text-[#a1a1aa]">{dw.totalTrades}</td>
+                        <td className="py-1.5 px-2">
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                              dw.riskScore <= 30
+                                ? 'bg-[#00FF88]/15 text-[#00FF88] border border-[#00FF88]/30'
+                                : 'bg-[#f59e0b]/15 text-[#f59e0b] border border-[#f59e0b]/30'
+                            }`}
+                          >
+                            Score {dw.riskScore}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2 font-bold text-[#00FF88]">+{dw.recentPnlSol.toFixed(2)} SOL</td>
+                        <td className="py-1.5 px-2 text-right">
+                          <button
+                            onClick={() => handleAddDiscovered(dw)}
+                            disabled={isAlreadyAdded}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all ${
+                              isAlreadyAdded
+                                ? 'bg-[#27272a] text-[#71717a] cursor-not-allowed'
+                                : 'bg-[#00FF88] text-[#09090b] hover:bg-[#00e67a]'
+                            }`}
+                          >
+                            {isAlreadyAdded ? 'MONITORED' : '+ Add to Copy'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Top Header & Search Bar */}
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3 bg-[#18181b] border border-[#27272a] rounded p-3">
         <div>

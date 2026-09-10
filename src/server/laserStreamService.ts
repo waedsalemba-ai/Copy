@@ -197,26 +197,23 @@ export class LaserStreamService extends EventEmitter {
     if (!this.connected || this.isPolling || this.monitoredWallets.size === 0) return;
     this.isPolling = true;
     try {
-      // Previously this awaited each wallet fully (RPC round-trip + a fixed
-      // 200ms pacing delay) one at a time, so total poll time scaled
-      // linearly with wallet count — past ~30 wallets a single pass no
-      // longer finished inside the 7s poll interval. The actual RPC pacing
-      // is already enforced centrally by rpcService's rate limiter (max 2
-      // concurrent calls, 150ms between dispatches), so fanning all wallets
-      // out via Promise.allSettled and letting that shared limiter do the
-      // throttling gets the same rate-limit safety without the per-wallet
-      // serialization.
-      const results = await Promise.allSettled(
+      const pollPromise = Promise.allSettled(
         Array.from(this.monitoredWallets).map(async (address) => {
-          const pubkey = new PublicKey(address);
+          const trimmed = address.trim();
+          const pubkey = new PublicKey(trimmed);
           const sigInfos = await rpcService.getSignaturesForAddress(pubkey, { limit: 10 });
           for (const sigInfo of sigInfos) {
             if (sigInfo.err) continue;
-            this.enqueueSignature(address, sigInfo.signature);
+            this.enqueueSignature(trimmed, sigInfo.signature);
           }
         })
       );
-      void results; // individual failures are per-wallet and already non-fatal
+
+      // Guard: enforce a strict 6-second timeout so polling pass never hangs or blocks isPolling indefinitely
+      await Promise.race([
+        pollPromise,
+        new Promise((resolve) => setTimeout(resolve, 6000)),
+      ]);
     } catch {
       // Ignore polling errors
     } finally {
@@ -252,25 +249,36 @@ export class LaserStreamService extends EventEmitter {
     this.isProcessingQueue = true;
 
     try {
-      while (this.queue.length > 0) {
-        const item = this.queue.shift();
-        if (!item) break;
+      while (this.queue.length > 0 && this.connected) {
+        // Process in small parallel batches of up to 3 transactions to avoid head-of-line blocking
+        const items = this.queue.splice(0, 3);
+        if (items.length === 0) break;
 
-        try {
-          await this.handleLogNotification(item.walletAddress, item.signature);
-          this.processedSignatures.add(item.signature);
-          if (this.processedSignatures.size > 2000) {
-            const [oldest] = this.processedSignatures;
-            this.processedSignatures.delete(oldest);
-          }
-        } catch (err: any) {
-          console.warn(`[LaserStream] Could not process ${item.signature.slice(0, 8)}...:`, err?.message || err);
-        } finally {
-          this.inFlightSignatures.delete(item.signature);
-        }
+        await Promise.allSettled(
+          items.map(async (item) => {
+            try {
+              // Wrap single transaction handling in a 6-second watchdog timeout
+              await Promise.race([
+                this.handleLogNotification(item.walletAddress, item.signature),
+                new Promise<boolean>((_, reject) =>
+                  setTimeout(() => reject(new Error('Ingestion processing timeout')), 6000)
+                ),
+              ]);
+              this.processedSignatures.add(item.signature);
+              if (this.processedSignatures.size > 2000) {
+                const [oldest] = this.processedSignatures;
+                this.processedSignatures.delete(oldest);
+              }
+            } catch (err: any) {
+              console.warn(`[LaserStream] Could not process ${item.signature.slice(0, 8)}...:`, err?.message || err);
+            } finally {
+              this.inFlightSignatures.delete(item.signature);
+            }
+          })
+        );
 
-        // Pacing delay between processing transactions to stay well below RPC rate limits
-        await new Promise((r) => setTimeout(r, 100));
+        // Pacing delay between batches to stay well below RPC rate limits
+        await new Promise((r) => setTimeout(r, 50));
       }
     } finally {
       this.isProcessingQueue = false;
@@ -311,10 +319,11 @@ export class LaserStreamService extends EventEmitter {
       accountKeysFromLookups: meta.loadedAddresses,
     });
 
+    const normalizedWallet = walletAddress.trim();
     let walletIndex = -1;
     for (let i = 0; i < accountKeys.length; i++) {
       const key = accountKeys.get(i);
-      if (key && key.toBase58() === walletAddress) {
+      if (key && key.toBase58().trim() === normalizedWallet) {
         walletIndex = i;
         break;
       }
@@ -342,10 +351,10 @@ export class LaserStreamService extends EventEmitter {
     // pick and the code reports the wallet as having "bought/sold SOL"
     // instead of the actual token.
     const matchesWallet = (b: any) => {
-      if (b.owner === walletAddress) return true;
+      if (b.owner && b.owner.trim() === normalizedWallet) return true;
       if (typeof b.accountIndex === 'number') {
         const key = accountKeys.get(b.accountIndex)?.toBase58();
-        if (key === walletAddress) return true;
+        if (key && key.trim() === normalizedWallet) return true;
       }
       return false;
     };

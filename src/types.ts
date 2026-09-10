@@ -234,6 +234,23 @@ export interface AppSettings {
 
   minTradeAlertValueUsd: number;
   webhookUrl?: string;
+
+  // Live Execution & MEV Protection
+  priorityFeeMode?: 'STATIC' | 'DYNAMIC';
+  staticPriorityFeeLamports?: number;
+  jitoTipLamports?: number;
+  jitoBundleEnabled?: boolean;
+}
+
+export interface DiscoveredWallet {
+  address: string;
+  traderName: string;
+  winRatePercent: number;
+  totalTrades: number;
+  avgHoldingTimeSeconds: number;
+  recentPnlSol: number;
+  riskScore: number; // Lower is better
+  lastActive: number;
 }
 
 export interface AcceptanceTestStepResult {

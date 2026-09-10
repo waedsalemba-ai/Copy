@@ -117,15 +117,15 @@ export const Navbar: React.FC<NavbarProps> = ({
           {onToggleLive && (
             <button
               onClick={onToggleLive}
-              title={metrics.liveStreamRunning !== false ? 'Live Stream Active (Click to Stop)' : 'Live Stream Stopped (Click to Start)'}
+              title={Boolean(metrics.liveStreamRunning) ? 'Live Stream Active (Click to Stop)' : 'Live Stream Stopped (Click to Start)'}
               className={`flex items-center gap-1.5 px-2 py-1 rounded font-mono text-[11px] border transition-all ${
-                metrics.liveStreamRunning !== false
+                Boolean(metrics.liveStreamRunning)
                   ? 'bg-[#00FF88]/15 border-[#00FF88]/40 text-[#00FF88]'
                   : 'bg-[#27272a]/40 border-[#3f3f46] text-[#a1a1aa] hover:border-[#71717a]'
               }`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${metrics.liveStreamRunning !== false ? 'bg-[#00FF88] animate-pulse' : 'bg-[#71717a]'}`} />
-              <span className="font-bold">LIVE: {metrics.liveStreamRunning !== false ? 'RUNNING' : 'STOPPED'}</span>
+              <span className={`w-1.5 h-1.5 rounded-full ${Boolean(metrics.liveStreamRunning) ? 'bg-[#00FF88] animate-pulse' : 'bg-[#71717a]'}`} />
+              <span className="font-bold">LIVE: {Boolean(metrics.liveStreamRunning) ? 'RUNNING' : 'STOPPED'}</span>
             </button>
           )}
 

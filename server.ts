@@ -13,6 +13,7 @@ import { runAcceptanceTestSuite } from './src/server/acceptanceTestRunner';
 import { buyEntryEngine } from './src/server/buyEntryEngine';
 import './src/server/alertEngine'; // Initialize alert listener
 import { paperTradingService } from './src/server/paperTradingService'; // Initialize paper-trading copy listener
+import { walletScannerService } from './src/server/walletScanner';
 
 import { isFirestoreServerQuotaExceeded } from './src/server/firebaseServer';
 
@@ -24,6 +25,9 @@ async function startServer() {
   db.initFirestoreSync().catch((err) => {
     console.warn('[Firebase] Initial sync notice:', err?.message || err);
   });
+
+  // Start Smart Wallet Discovery service
+  walletScannerService.startScanner();
 
   const httpServer = http.createServer(app);
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
@@ -215,6 +219,20 @@ async function startServer() {
       activeWallets: db.getWallets().length,
       timestamp: Date.now(),
     });
+  });
+
+  // Smart Wallet Discovery
+  app.get('/api/discovery', (_req, res) => {
+    res.json(walletScannerService.getDiscoveredWallets());
+  });
+
+  app.post('/api/discovery/scan', async (_req, res) => {
+    try {
+      const wallets = await walletScannerService.performDiscoveryScan();
+      res.json({ success: true, count: wallets.length, wallets });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Discovery scan failed' });
+    }
   });
 
   // Wallets

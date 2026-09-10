@@ -457,20 +457,20 @@ const safeJsonFetch = async <T,>(url: string): Promise<T | null> => {
             {/* Live Stream Pipeline Status & Control Strip */}
             <div className="bg-[#18181b] border border-[#27272a] rounded p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 font-mono">
               <div className="flex items-center gap-2">
-                <span className={`w-2.5 h-2.5 rounded-full ${metrics.liveStreamRunning !== false ? 'bg-[#00FF88] animate-pulse' : 'bg-[#71717a]'}`} />
+                <span className={`w-2.5 h-2.5 rounded-full ${Boolean(metrics.liveStreamRunning) ? 'bg-[#00FF88] animate-pulse' : 'bg-[#71717a]'}`} />
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-[#fafafa] uppercase">LIVE SOLANA STREAM INGESTION</span>
                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
-                      metrics.liveStreamRunning !== false
+                      Boolean(metrics.liveStreamRunning)
                         ? 'bg-[#00FF88]/15 text-[#00FF88] border border-[#00FF88]/30'
                         : 'bg-[#ef4444]/15 text-[#ef4444] border border-[#ef4444]/30'
                     }`}>
-                      {metrics.liveStreamRunning !== false ? 'INGESTION ACTIVE' : 'PIPELINE STOPPED'}
+                      {Boolean(metrics.liveStreamRunning) ? 'INGESTION ACTIVE' : 'PIPELINE STOPPED'}
                     </span>
                   </div>
                   <p className="text-[10px] text-[#71717a]">
-                    {metrics.liveStreamRunning !== false
+                    {Boolean(metrics.liveStreamRunning)
                       ? `Connected: ${metrics.laserstreamEndpoint || 'wss://laserstream.solana.com/v1/stream'} • Detection Latency: ${metrics.avgDetectionLatencyMs}ms`
                       : 'Live ingestion stopped. WebSocket & polling listeners are dormant.'}
                   </p>
@@ -480,12 +480,12 @@ const safeJsonFetch = async <T,>(url: string): Promise<T | null> => {
               <button
                 onClick={handleToggleLive}
                 className={`px-3 py-1 rounded font-bold text-[11px] transition-all uppercase ${
-                  metrics.liveStreamRunning !== false
+                  Boolean(metrics.liveStreamRunning)
                     ? 'bg-[#ef4444]/15 text-[#ef4444] border border-[#ef4444]/40 hover:bg-[#ef4444]/25'
                     : 'bg-[#00FF88] text-[#09090b] hover:bg-[#00e67a]'
                 }`}
               >
-                {metrics.liveStreamRunning !== false ? 'STOP LIVE MONITORING' : 'START LIVE MONITORING'}
+                {Boolean(metrics.liveStreamRunning) ? 'STOP LIVE MONITORING' : 'START LIVE MONITORING'}
               </button>
             </div>
 

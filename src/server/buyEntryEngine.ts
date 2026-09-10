@@ -44,6 +44,10 @@ class BuyEntryEngine {
     }, WATCHLIST_TICK_MS);
   }
 
+  public async processWatchlist(): Promise<void> {
+    return this.processWatchlistInternal();
+  }
+
   public getWatchlist(): Array<{
     tokenMint: string;
     tokenSymbol: string;

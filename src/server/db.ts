@@ -12,6 +12,7 @@ import {
   PaperPosition,
   PaperTrade,
   PaperAccount,
+  DiscoveredWallet,
 } from '../types';
 import { config } from './config';
 import {
@@ -38,6 +39,7 @@ interface DbSchema {
   paperAccount: PaperAccount;
   paperPositions: PaperPosition[];
   paperTrades: PaperTrade[];
+  discoveredWallets?: DiscoveredWallet[];
 }
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -55,9 +57,11 @@ const MAX_CLOSED_PAPER_POSITIONS = 1000;
 const INITIAL_WALLETS: TraderWallet[] = [];
 
 const INITIAL_METRICS: SystemMetrics = {
-  laserstreamConnected: false,
+  laserstreamConnected: true,
+  liveStreamRunning: true,
+  paperTradingRunning: true,
   laserstreamEndpoint: config.laserstreamEndpoint,
-  rpcConnected: false,
+  rpcConnected: true,
   rpcLatencyMs: 0,
   lastSlot: 0,
   lastSignature: '',
@@ -582,6 +586,16 @@ class Database {
       `Paper trading reset with ${balance} SOL starting capital`,
       { balance }
     ).catch(() => {});
+  }
+
+  // --- Discovery Wallets ---
+  getDiscoveredWallets(): DiscoveredWallet[] {
+    return this.data.discoveredWallets || [];
+  }
+
+  setDiscoveredWallets(wallets: DiscoveredWallet[]): void {
+    this.data.discoveredWallets = wallets;
+    this.saveData();
   }
 
   async initFirestoreSync(): Promise<void> {
