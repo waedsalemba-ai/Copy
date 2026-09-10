@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: solana-trader-wallet-monitor
+    env: node
+    plan: starter
+    buildCommand: bun install && bun run build
+    startCommand: node dist/server.cjs
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000

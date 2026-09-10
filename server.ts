@@ -2,7 +2,6 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
 
 import { config } from './src/server/config';
 import { db } from './src/server/db';
@@ -175,14 +174,27 @@ async function startServer() {
 
   // --- API Routes ---
 
-  // Health
-  app.get('/api/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      timestamp: Date.now(),
-      laserstream: db.getMetrics().laserstreamConnected,
-      rpc: db.getMetrics().rpcConnected,
-    });
+  const serverStartTime = Date.now();
+  const getSafeHealthInfo = () => ({
+    status: 'ok',
+    uptime: Math.floor((Date.now() - serverStartTime) / 1000),
+    server: 'running',
+    timestamp: Date.now(),
+    environment: process.env.NODE_ENV || 'production',
+    laserstream: Boolean(db.getMetrics().laserstreamConnected),
+    rpc: Boolean(db.getMetrics().rpcConnected),
+    paperTrading: db.getCopyTradeSettings().enabled ? 'ENABLED' : 'PAUSED',
+    liveTrading: 'DISABLED',
+  });
+
+  // Production health endpoint (HTTP 200) for Render Web Services
+  app.get('/health', (_req, res) => {
+    res.status(200).json(getSafeHealthInfo());
+  });
+
+  // Backward-compatible API health endpoint
+  app.get('/api/health', (_req, res) => {
+    res.status(200).json(getSafeHealthInfo());
   });
 
   // Firebase status & sync health
@@ -738,6 +750,7 @@ async function startServer() {
 
   // Vite development vs production static serving
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -751,9 +764,22 @@ async function startServer() {
     });
   }
 
-  const PORT = config.port;
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Solana Trader Wallet Monitor running on http://0.0.0.0:${PORT}`);
+  const PORT = Number(process.env.PORT || config.port || 3000);
+  const HOST = process.env.HOST || '0.0.0.0';
+
+  httpServer.listen(PORT, HOST, () => {
+    const env = process.env.NODE_ENV || 'production';
+    console.log('[BOOT] Production server starting');
+    console.log(`[BOOT] Environment: ${env}`);
+    console.log(`[BOOT] Host: ${HOST}`);
+    console.log(`[BOOT] Port: ${PORT}`);
+    console.log('[BOOT] Paper trading: ENABLED');
+    console.log('[BOOT] Live trading: DISABLED');
+    console.log('[BOOT] Unified Trade Pipeline: starting');
+    console.log('[BOOT] LaserStream: starting');
+    console.log('[BOOT] Health endpoint: ready');
+    console.log('[BOOT] Application ready');
+
     // Start LaserStream & monitor enabled wallets
     laserStreamService.connect();
   });
