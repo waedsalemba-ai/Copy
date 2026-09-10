@@ -4,7 +4,7 @@ services:
     env: node
     plan: starter
     buildCommand: bun install && bun run build
-    startCommand: node dist/server.cjs
+    startCommand: bun run start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
