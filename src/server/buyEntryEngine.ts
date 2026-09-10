@@ -38,7 +38,7 @@ class BuyEntryEngine {
 
   constructor() {
     setInterval(() => {
-      this.processWatchlist().catch((err) => {
+      this.processWatchlistInternal().catch((err) => {
         console.error('[BuyEntry] Watchlist processing failed:', err);
       });
     }, WATCHLIST_TICK_MS);
@@ -102,21 +102,14 @@ class BuyEntryEngine {
     );
   }
 
-  private async processWatchlist(): Promise<void> {
+  private async processWatchlistInternal(): Promise<void> {
     if (this.isProcessingWatchlist) return;
     this.isProcessingWatchlist = true;
     try {
-      await this.processWatchlistInternal();
-    } finally {
-      this.isProcessingWatchlist = false;
-    }
-  }
+      const settings = db.getBuyEntrySettings();
+      const now = Date.now();
 
-  private async processWatchlistInternal(): Promise<void> {
-    const settings = db.getBuyEntrySettings();
-    const now = Date.now();
-
-    for (const [key, candidate] of Array.from(this.watchlist.entries())) {
+      for (const [key, candidate] of Array.from(this.watchlist.entries())) {
       const ageMinutes = (now - candidate.firstSeenAt) / 60000;
       if (ageMinutes > settings.watchWindowMinutes) {
         console.log(`[BuyEntry] Watch window expired for $${candidate.trade.tokenSymbol} — not mirrored.`);
@@ -169,6 +162,9 @@ class BuyEntryEngine {
       }
 
       candidate.lastVerdict = result;
+    }
+    } finally {
+      this.isProcessingWatchlist = false;
     }
   }
 

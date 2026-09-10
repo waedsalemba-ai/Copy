@@ -117,6 +117,14 @@ export class LaserStreamService extends EventEmitter {
   }
 
   public subscribeWallet(address: string): void {
+    if (!address || typeof address !== 'string') return;
+    try {
+      new PublicKey(address);
+    } catch {
+      console.warn(`[LaserStream] Invalid wallet address provided: ${address}`);
+      return;
+    }
+
     if (!this.connected) {
       this.connect();
     }
@@ -201,7 +209,7 @@ export class LaserStreamService extends EventEmitter {
       const results = await Promise.allSettled(
         Array.from(this.monitoredWallets).map(async (address) => {
           const pubkey = new PublicKey(address);
-          const sigInfos = await rpcService.getSignaturesForAddress(pubkey, { limit: 2 });
+          const sigInfos = await rpcService.getSignaturesForAddress(pubkey, { limit: 10 });
           for (const sigInfo of sigInfos) {
             if (sigInfo.err) continue;
             this.enqueueSignature(address, sigInfo.signature);
@@ -377,8 +385,8 @@ export class LaserStreamService extends EventEmitter {
     });
 
     // True SOL movement = native lamports (fee/rent) + any WSOL wrap/unwrap.
-    const preSolBalance = 0;
-    const postSolBalance = nativeSolDelta + wsolDelta;
+    const preSolBalance = (meta.preBalances[walletIndex] ?? 0) / 1e9;
+    const postSolBalance = (meta.postBalances[walletIndex] ?? 0) / 1e9;
 
     const instructions: RawSolanaInstruction[] = tx.transaction.message.compiledInstructions.map(
       (ix) => ({
@@ -386,8 +394,8 @@ export class LaserStreamService extends EventEmitter {
         data: Buffer.from(ix.data).toString('base64'),
         keys: ix.accountKeyIndexes.map((idx) => ({
           pubkey: accountKeys.get(idx)?.toBase58() || 'UNKNOWN',
-          isSigner: false,
-          isWritable: false,
+          isSigner: tx.transaction.message.isAccountSigner(idx),
+          isWritable: tx.transaction.message.isAccountWritable(idx),
         })),
       })
     );

@@ -50,6 +50,8 @@ const INITIAL_METRICS: SystemMetrics = {
   wsClientCount: 0,
   reconnectCount: 0,
   activeWalletsCount: 0,
+  liveStreamRunning: false,
+  paperTradingRunning: false,
 };
 
 const INITIAL_SETTINGS: AppSettings = {
@@ -76,31 +78,66 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
 
+  const postWithRetry = async (url: string, options: RequestInit = {}, retries = 1): Promise<Response> => {
+    let lastErr: any = null;
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const res = await fetch(url, options);
+        if (res.ok) return res;
+        lastErr = new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        lastErr = err;
+      }
+      if (i < retries) {
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+    throw lastErr || new Error('Network error');
+  };
+
   const handleToggleLive = async () => {
-    const isRunning = metrics.liveStreamRunning !== false;
+    const isRunning = Boolean(metrics.liveStreamRunning);
     const endpoint = isRunning ? '/api/live/stop' : '/api/live/start';
     try {
-      const res = await fetch(endpoint, { method: 'POST' });
-      const data = await res.json();
-      setMetrics((prev) => ({ ...prev, liveStreamRunning: data.running }));
-      setToastMessage(data.running ? 'Live Stream Started' : 'Live Stream Stopped');
+      const res = await postWithRetry(endpoint, { method: 'POST' });
+      const contentType = res.headers.get('Content-Type') || '';
+      let runningState = !isRunning;
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        if (typeof data.running === 'boolean') {
+          runningState = data.running;
+        }
+      }
+      setMetrics((prev) => ({ ...prev, liveStreamRunning: runningState }));
+      setToastMessage(runningState ? 'Live Stream Started' : 'Live Stream Stopped');
       setTimeout(() => setToastMessage(null), 3000);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to toggle live stream', err);
+      setToastMessage(`Failed to toggle live stream: ${err?.message || 'Network error'}`);
+      setTimeout(() => setToastMessage(null), 4000);
     }
   };
 
   const handleTogglePaper = async () => {
-    const isRunning = !!metrics.paperTradingRunning;
+    const isRunning = Boolean(metrics.paperTradingRunning);
     const endpoint = isRunning ? '/api/paper/stop' : '/api/paper/start';
     try {
-      const res = await fetch(endpoint, { method: 'POST' });
-      const data = await res.json();
-      setMetrics((prev) => ({ ...prev, paperTradingRunning: data.running }));
-      setToastMessage(data.running ? 'Paper Trading Started' : 'Paper Trading Stopped');
+      const res = await postWithRetry(endpoint, { method: 'POST' });
+      const contentType = res.headers.get('Content-Type') || '';
+      let runningState = !isRunning;
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        if (typeof data.running === 'boolean') {
+          runningState = data.running;
+        }
+      }
+      setMetrics((prev) => ({ ...prev, paperTradingRunning: runningState }));
+      setToastMessage(runningState ? 'Paper Trading Started' : 'Paper Trading Stopped');
       setTimeout(() => setToastMessage(null), 3000);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to toggle paper trading', err);
+      setToastMessage(`Failed to toggle paper trading: ${err?.message || 'Network error'}`);
+      setTimeout(() => setToastMessage(null), 4000);
     }
   };
 
@@ -227,10 +264,6 @@ const safeJsonFetch = async <T,>(url: string): Promise<T | null> => {
               } ${payload.tokenSymbol} (${payload.solAmount.toFixed(2)} SOL)`;
               setToastMessage(toastTxt);
               setTimeout(() => setToastMessage(null), 3000);
-
-              // Refresh positions & metrics
-              safeJsonFetch<Position[]>('/api/positions').then((pos) => pos && setPositions(pos));
-              safeJsonFetch<TraderWallet[]>('/api/wallets').then((wal) => wal && setWallets(wal));
               break;
 
             case 'POSITION_UPDATED':

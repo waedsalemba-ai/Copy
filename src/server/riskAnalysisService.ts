@@ -91,10 +91,27 @@ class RiskAnalysisService {
   }
 
   private async withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
-    ]);
+    return new Promise<T>((resolve) => {
+      let resolved = false;
+      const timer = setTimeout(() => {
+        resolved = true;
+        resolve(fallback);
+      }, ms);
+
+      promise
+        .then((result) => {
+          if (!resolved) {
+            clearTimeout(timer);
+            resolve(result);
+          }
+        })
+        .catch(() => {
+          if (!resolved) {
+            clearTimeout(timer);
+            resolve(fallback); // Gracefully fallback on error too
+          }
+        });
+    });
   }
 
   private async fetchDexScreenerStats(
@@ -255,6 +272,7 @@ class RiskAnalysisService {
       liquidityUsd: dexStats.liquidityUsd,
       topHolderPercent: holderConcentration.top1Percent,
       top10HolderPercent: holderConcentration.top10Percent,
+      topHoldersConcentrationPct: holderConcentration.top10Percent,
       ageMinutes: dexStats.ageMinutes,
       volume24hUsd: dexStats.volume24hUsd,
       marketCapUsd: dexStats.marketCapUsd,

@@ -47,12 +47,25 @@ export const PaperTradingPanel: React.FC = () => {
   const [buyEntrySettings, setBuyEntrySettings] = useState<BuyEntrySettings | null>(null);
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
 
+  // FIX #8: Local state for inputs to prevent API spam on every keystroke
+  const [localSettings, setLocalSettings] = useState<CopyTradeSettings | null>(null);
+  const [localBuyEntrySettings, setLocalBuyEntrySettings] = useState<BuyEntrySettings | null>(null);
+
   // Reset confirmation and error states
   const [showResetModal, setShowResetModal] = useState(false);
   const [resetBalance, setResetBalance] = useState<number>(10);
   const [isResetting, setIsResetting] = useState(false);
   const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
   const [actionErrorMsg, setActionErrorMsg] = useState<string | null>(null);
+
+  // Sync local state with server state when it updates
+  useEffect(() => {
+    if (settings) setLocalSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    if (buyEntrySettings) setLocalBuyEntrySettings(buyEntrySettings);
+  }, [buyEntrySettings]);
 
   const fetchPaperData = async () => {
     try {
@@ -83,8 +96,8 @@ export const PaperTradingPanel: React.FC = () => {
 
   useEffect(() => {
     fetchPaperData();
-    const interval = setInterval(fetchPaperData, 3000);
-    return () => clearInterval(interval);
+    // FIX #11: Removed aggressive 3-second polling to prevent server overload.
+    // UI updates are now handled via WebSocket events broadcasted from App.tsx.
   }, []);
 
   const postWithRetry = async (url: string, options: RequestInit = {}, retries = 1): Promise<Response> => {
@@ -107,11 +120,13 @@ export const PaperTradingPanel: React.FC = () => {
     if (!settings) return;
     setActionErrorMsg(null);
     try {
+      // FIX #8: Send only the updated fields (partial update) instead of the whole object
       const res = await postWithRetry('/api/paper/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...settings, ...updates }),
+        body: JSON.stringify(updates),
       });
+
       const contentType = res.headers.get('Content-Type') || '';
       if (res.ok) {
         if (contentType.includes('application/json')) {
@@ -121,8 +136,6 @@ export const PaperTradingPanel: React.FC = () => {
             setResetBalance(updates.startingVirtualSolBalance);
           }
         } else {
-          const text = await res.text();
-          console.error('[PaperTradingPanel] Received non-JSON response on update settings:', text.slice(0, 300));
           setActionErrorMsg('Failed to update settings: Server returned unexpected HTML content');
         }
       } else {
@@ -130,14 +143,10 @@ export const PaperTradingPanel: React.FC = () => {
         if (contentType.includes('application/json')) {
           const errJson = await res.json().catch(() => null);
           if (errJson?.error) errMsg = errJson.error;
-        } else {
-          const text = await res.text().catch(() => '');
-          if (text) errMsg = text.slice(0, 100);
         }
         setActionErrorMsg(`Failed to update settings: ${errMsg}`);
       }
     } catch (err: any) {
-      console.error('Failed to update paper settings:', err);
       setActionErrorMsg(`Failed to update settings: ${err?.message || 'Network error'}`);
     }
   };
@@ -148,10 +157,7 @@ export const PaperTradingPanel: React.FC = () => {
     setIsTogglingCopyTrading(true);
     setActionErrorMsg(null);
     try {
-      const res = await postWithRetry('/api/paper/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
+      const res = await postWithRetry('/api/paper/start', { method: 'POST' });
       if (res.ok) {
         const updated = await res.json();
         setSettings(updated);
@@ -160,7 +166,6 @@ export const PaperTradingPanel: React.FC = () => {
         setActionErrorMsg(`Failed to start copy trading: ${errJson?.error || res.statusText}`);
       }
     } catch (err: any) {
-      console.error('Failed to start copy trading:', err);
       setActionErrorMsg(`Failed to start copy trading: ${err?.message || 'Network error'}`);
     } finally {
       setIsTogglingCopyTrading(false);
@@ -171,10 +176,7 @@ export const PaperTradingPanel: React.FC = () => {
     setIsTogglingCopyTrading(true);
     setActionErrorMsg(null);
     try {
-      const res = await postWithRetry('/api/paper/stop', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
+      const res = await postWithRetry('/api/paper/stop', { method: 'POST' });
       if (res.ok) {
         const updated = await res.json();
         setSettings(updated);
@@ -183,7 +185,6 @@ export const PaperTradingPanel: React.FC = () => {
         setActionErrorMsg(`Failed to stop copy trading: ${errJson?.error || res.statusText}`);
       }
     } catch (err: any) {
-      console.error('Failed to stop copy trading:', err);
       setActionErrorMsg(`Failed to stop copy trading: ${err?.message || 'Network error'}`);
     } finally {
       setIsTogglingCopyTrading(false);
@@ -194,10 +195,11 @@ export const PaperTradingPanel: React.FC = () => {
     if (!buyEntrySettings) return;
     setActionErrorMsg(null);
     try {
+      // FIX #8: Send only the updated fields
       const res = await postWithRetry('/api/buy-entry/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...buyEntrySettings, ...updates }),
+        body: JSON.stringify(updates),
       });
       if (res.ok) {
         const updated = await res.json();
@@ -207,8 +209,24 @@ export const PaperTradingPanel: React.FC = () => {
         setActionErrorMsg(`Failed to update buy entry settings: ${errJson?.error || res.statusText}`);
       }
     } catch (err: any) {
-      console.error('Failed to update buy entry settings:', err);
       setActionErrorMsg(`Failed to update buy entry settings: ${err?.message || 'Network error'}`);
+    }
+  };
+
+  // FIX #10: Manual Exit Handler
+  const handleManualExit = async (positionId: string) => {
+    if (!window.confirm('Are you sure you want to manually exit this position at market price?')) return;
+    setActionErrorMsg(null);
+    try {
+      const res = await postWithRetry(`/api/paper/positions/${positionId}/exit`, { method: 'POST' });
+      if (res.ok) {
+        await fetchPaperData();
+      } else {
+        const errJson = await res.json().catch(() => null);
+        setActionErrorMsg(`Failed to exit position: ${errJson?.error || res.statusText}`);
+      }
+    } catch (err: any) {
+      setActionErrorMsg(`Failed to exit position: ${err?.message || 'Network error'}`);
     }
   };
 
@@ -236,7 +254,6 @@ export const PaperTradingPanel: React.FC = () => {
         setActionErrorMsg(`Failed to reset paper account: ${errJson?.error || res.statusText}`);
       }
     } catch (err: any) {
-      console.error('Failed to reset paper account:', err);
       setActionErrorMsg(`Failed to reset paper account: ${err?.message || 'Network error'}`);
     } finally {
       setIsResetting(false);
@@ -246,14 +263,12 @@ export const PaperTradingPanel: React.FC = () => {
   const openPositions = positions.filter((p) => p.status === 'OPEN');
   const closedPositions = positions.filter((p) => p.status === 'CLOSED');
 
-  // Helper to format hold time
   const formatHoldTime = (startTime: number, endTime: number): string => {
     const durationMs = endTime - startTime;
     const totalSeconds = Math.floor(durationMs / 1000);
     const hours = Math.floor(totalSeconds / 3600);
     const mins = Math.floor((totalSeconds % 3600) / 60);
     const secs = totalSeconds % 60;
-    
     if (hours > 0) return `${hours}h ${mins}m`;
     if (mins > 0) return `${mins}m ${secs}s`;
     return `${secs}s`;
@@ -316,7 +331,6 @@ export const PaperTradingPanel: React.FC = () => {
             Initial: {account ? `${account.startingVirtualSolBalance} SOL` : '—'}
           </div>
         </div>
-
         <div className="p-3 rounded bg-[#18181b] border border-[#27272a] shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-[#71717a] text-[10px] uppercase font-mono">
             <span>Open Positions Value</span>
@@ -329,7 +343,6 @@ export const PaperTradingPanel: React.FC = () => {
             {openPositions.length} active position{openPositions.length === 1 ? '' : 's'}
           </div>
         </div>
-
         <div className="p-3 rounded bg-[#18181b] border border-[#27272a] shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-[#71717a] text-[10px] uppercase font-mono">
             <span>Total Equity</span>
@@ -342,7 +355,6 @@ export const PaperTradingPanel: React.FC = () => {
             Liquid + Position Value
           </div>
         </div>
-
         <div className="p-3 rounded bg-[#18181b] border border-[#27272a] shadow-sm flex flex-col justify-between">
           <div className="flex items-center justify-between text-[#71717a] text-[10px] uppercase font-mono">
             <span>Total Realized P&L</span>
@@ -380,12 +392,9 @@ export const PaperTradingPanel: React.FC = () => {
             <span>Reset Account</span>
           </button>
         </div>
-
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Copy Trading
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Copy Trading</label>
             <div className="flex items-center gap-2 mt-1">
               <button
                 onClick={handleStartCopyTrading}
@@ -401,92 +410,83 @@ export const PaperTradingPanel: React.FC = () => {
               >
                 Stop
               </button>
-              <span
-                className={`text-[11px] font-mono font-bold ${
-                  settings?.enabled ? 'text-[#00FF88]' : 'text-[#71717a]'
-                }`}
-              >
+              <span className={`text-[11px] font-mono font-bold ${settings?.enabled ? 'text-[#00FF88]' : 'text-[#71717a]'}`}>
                 {settings?.enabled ? 'Running' : 'Stopped'}
               </span>
             </div>
           </div>
 
+          {/* FIX #8: All number inputs now use local state and trigger API only on onBlur */}
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              SOL Per Trade
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">SOL Per Trade</label>
             <input
               type="number"
-              value={settings?.fixedSolAmountPerTrade ?? 0.5}
-              onChange={(e) => handleUpdateSettings({ fixedSolAmountPerTrade: parseFloat(e.target.value) || 0.1 })}
+              value={localSettings?.fixedSolAmountPerTrade ?? 0.5}
+              onChange={(e) => setLocalSettings(prev => prev ? { ...prev, fixedSolAmountPerTrade: parseFloat(e.target.value) || 0 } : prev)}
+              onBlur={() => localSettings && handleUpdateSettings({ fixedSolAmountPerTrade: localSettings.fixedSolAmountPerTrade })}
               step={0.01}
               min={0.01}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88]"
             />
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Take Profit (%)
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Take Profit (%)</label>
             <input
               type="number"
-              value={settings?.takeProfitPercent ?? 30}
-              onChange={(e) => handleUpdateSettings({ takeProfitPercent: parseFloat(e.target.value) || 0 })}
+              value={localSettings?.takeProfitPercent ?? 30}
+              onChange={(e) => setLocalSettings(prev => prev ? { ...prev, takeProfitPercent: parseFloat(e.target.value) || 0 } : prev)}
+              onBlur={() => localSettings && handleUpdateSettings({ takeProfitPercent: localSettings.takeProfitPercent })}
               step={1}
               min={1}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#00FF88] font-mono text-xs focus:outline-none focus:border-[#00FF88]"
             />
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Stop Loss (%)
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Stop Loss (%)</label>
             <input
               type="number"
-              value={settings?.stopLossPercent ?? 15}
-              onChange={(e) => handleUpdateSettings({ stopLossPercent: parseFloat(e.target.value) || 0 })}
+              value={localSettings?.stopLossPercent ?? 15}
+              onChange={(e) => setLocalSettings(prev => prev ? { ...prev, stopLossPercent: parseFloat(e.target.value) || 0 } : prev)}
+              onBlur={() => localSettings && handleUpdateSettings({ stopLossPercent: localSettings.stopLossPercent })}
               step={1}
               min={1}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#ff4444] font-mono text-xs focus:outline-none focus:border-[#ff4444]"
             />
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Slippage (bps)
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Slippage (bps)</label>
             <input
               type="number"
-              value={settings?.simulatedSlippageBps ?? 50}
-              onChange={(e) => handleUpdateSettings({ simulatedSlippageBps: parseFloat(e.target.value) || 0 })}
+              value={localSettings?.simulatedSlippageBps ?? 50}
+              onChange={(e) => setLocalSettings(prev => prev ? { ...prev, simulatedSlippageBps: parseFloat(e.target.value) || 0 } : prev)}
+              onBlur={() => localSettings && handleUpdateSettings({ simulatedSlippageBps: localSettings.simulatedSlippageBps })}
               step={1}
               min={0}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88]"
             />
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Starting Balance
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Starting Balance</label>
             <input
               type="number"
-              value={settings?.startingVirtualSolBalance ?? 10}
-              onChange={(e) => handleUpdateSettings({ startingVirtualSolBalance: parseFloat(e.target.value) || 1 })}
+              value={localSettings?.startingVirtualSolBalance ?? 10}
+              onChange={(e) => setLocalSettings(prev => prev ? { ...prev, startingVirtualSolBalance: parseFloat(e.target.value) || 0 } : prev)}
+              onBlur={() => localSettings && handleUpdateSettings({ startingVirtualSolBalance: localSettings.startingVirtualSolBalance })}
               step={0.1}
               min={0.1}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88]"
             />
           </div>
-
           <div className="flex flex-col justify-end">
             <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1 flex items-center gap-1.5">
               <input
                 type="checkbox"
-                checked={settings?.confidenceSizingEnabled ?? false}
-                onChange={(e) => handleUpdateSettings({ confidenceSizingEnabled: e.target.checked })}
+                checked={localSettings?.confidenceSizingEnabled ?? false}
+                onChange={(e) => {
+                  const newVal = e.target.checked;
+                  setLocalSettings(prev => prev ? { ...prev, confidenceSizingEnabled: newVal } : prev);
+                  handleUpdateSettings({ confidenceSizingEnabled: newVal });
+                }}
                 className="accent-[#00FF88]"
               />
               Confidence Sizing
@@ -494,34 +494,39 @@ export const PaperTradingPanel: React.FC = () => {
             <div className="flex items-center gap-1">
               <input
                 type="number"
-                value={settings?.minSizeMultiplier ?? 0.4}
-                onChange={(e) => handleUpdateSettings({ minSizeMultiplier: parseFloat(e.target.value) || 0.1 })}
+                value={localSettings?.minSizeMultiplier ?? 0.4}
+                onChange={(e) => setLocalSettings(prev => prev ? { ...prev, minSizeMultiplier: parseFloat(e.target.value) || 0 } : prev)}
+                onBlur={() => localSettings && handleUpdateSettings({ minSizeMultiplier: localSettings.minSizeMultiplier })}
                 step={0.1}
                 min={0.1}
-                disabled={!settings?.confidenceSizingEnabled}
+                disabled={!localSettings?.confidenceSizingEnabled}
                 title="Min size multiplier (lowest-confidence trades)"
                 className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
               />
               <span className="text-[#71717a] text-[10px]">–</span>
               <input
                 type="number"
-                value={settings?.maxSizeMultiplier ?? 1.75}
-                onChange={(e) => handleUpdateSettings({ maxSizeMultiplier: parseFloat(e.target.value) || 1 })}
+                value={localSettings?.maxSizeMultiplier ?? 1.75}
+                onChange={(e) => setLocalSettings(prev => prev ? { ...prev, maxSizeMultiplier: parseFloat(e.target.value) || 1 } : prev)}
+                onBlur={() => localSettings && handleUpdateSettings({ maxSizeMultiplier: localSettings.maxSizeMultiplier })}
                 step={0.1}
                 min={1}
-                disabled={!settings?.confidenceSizingEnabled}
+                disabled={!localSettings?.confidenceSizingEnabled}
                 title="Max size multiplier (highest-confidence trades)"
                 className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
               />
             </div>
           </div>
-
           <div className="flex flex-col justify-end">
             <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1 flex items-center gap-1.5">
               <input
                 type="checkbox"
-                checked={settings?.trailingStopEnabled ?? false}
-                onChange={(e) => handleUpdateSettings({ trailingStopEnabled: e.target.checked })}
+                checked={localSettings?.trailingStopEnabled ?? false}
+                onChange={(e) => {
+                  const newVal = e.target.checked;
+                  setLocalSettings(prev => prev ? { ...prev, trailingStopEnabled: newVal } : prev);
+                  handleUpdateSettings({ trailingStopEnabled: newVal });
+                }}
                 className="accent-[#00FF88]"
               />
               Trailing Stop
@@ -529,22 +534,24 @@ export const PaperTradingPanel: React.FC = () => {
             <div className="flex items-center gap-1">
               <input
                 type="number"
-                value={settings?.trailingActivationPercent ?? 15}
-                onChange={(e) => handleUpdateSettings({ trailingActivationPercent: parseFloat(e.target.value) || 1 })}
+                value={localSettings?.trailingActivationPercent ?? 15}
+                onChange={(e) => setLocalSettings(prev => prev ? { ...prev, trailingActivationPercent: parseFloat(e.target.value) || 1 } : prev)}
+                onBlur={() => localSettings && handleUpdateSettings({ trailingActivationPercent: localSettings.trailingActivationPercent })}
                 step={1}
                 min={1}
-                disabled={!settings?.trailingStopEnabled}
+                disabled={!localSettings?.trailingStopEnabled}
                 title="Activate trailing once gain reaches this %"
                 className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#00FF88] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
               />
               <span className="text-[#71717a] text-[10px]">/</span>
               <input
                 type="number"
-                value={settings?.trailingStopPercent ?? 12}
-                onChange={(e) => handleUpdateSettings({ trailingStopPercent: parseFloat(e.target.value) || 1 })}
+                value={localSettings?.trailingStopPercent ?? 12}
+                onChange={(e) => setLocalSettings(prev => prev ? { ...prev, trailingStopPercent: parseFloat(e.target.value) || 1 } : prev)}
+                onBlur={() => localSettings && handleUpdateSettings({ trailingStopPercent: localSettings.trailingStopPercent })}
                 step={1}
                 min={1}
-                disabled={!settings?.trailingStopEnabled}
+                disabled={!localSettings?.trailingStopEnabled}
                 title="Exit if price pulls back this % from peak"
                 className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#ff4444] font-mono text-xs focus:outline-none focus:border-[#ff4444] disabled:opacity-40"
               />
@@ -564,53 +571,47 @@ export const PaperTradingPanel: React.FC = () => {
             {buyEntrySettings?.enabled ? 'GATING ACTIVE' : 'DISABLED (MIRROR ALL)'}
           </span>
         </div>
-
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Buy Entry Gates
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Buy Entry Gates</label>
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
-                checked={buyEntrySettings?.enabled || false}
-                onChange={(e) => handleUpdateBuyEntrySettings({ enabled: e.target.checked })}
+                checked={localBuyEntrySettings?.enabled || false}
+                onChange={(e) => {
+                  const newVal = e.target.checked;
+                  setLocalBuyEntrySettings(prev => prev ? { ...prev, enabled: newVal } : prev);
+                  handleUpdateBuyEntrySettings({ enabled: newVal });
+                }}
                 className="w-4 h-4 accent-[#3b82f6]"
               />
               <span className="text-[11px] text-[#fafafa] font-mono font-bold">
-                {buyEntrySettings?.enabled ? 'Enabled' : 'Disabled'}
+                {localBuyEntrySettings?.enabled ? 'Enabled' : 'Disabled'}
               </span>
             </label>
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Min Momentum Score
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Min Momentum Score</label>
             <input
               type="number"
-              value={buyEntrySettings?.minMomentumScoreToBuy ?? 75}
-              onChange={(e) =>
-                handleUpdateBuyEntrySettings({ minMomentumScoreToBuy: parseInt(e.target.value, 10) || 0 })
-              }
+              value={localBuyEntrySettings?.minMomentumScoreToBuy ?? 75}
+              onChange={(e) => setLocalBuyEntrySettings(prev => prev ? { ...prev, minMomentumScoreToBuy: parseInt(e.target.value, 10) || 0 } : prev)}
+              onBlur={() => localBuyEntrySettings && handleUpdateBuyEntrySettings({ minMomentumScoreToBuy: localBuyEntrySettings.minMomentumScoreToBuy })}
               step={1}
               min={0}
               max={100}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#3b82f6]"
             />
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Max Acceptable Risk
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Max Acceptable Risk</label>
             <select
-              value={buyEntrySettings?.maxAcceptableRiskLevel || 'MEDIUM'}
-              onChange={(e) =>
-                handleUpdateBuyEntrySettings({
-                  maxAcceptableRiskLevel: e.target.value as 'LOW' | 'MEDIUM' | 'HIGH',
-                })
-              }
+              value={localBuyEntrySettings?.maxAcceptableRiskLevel || 'MEDIUM'}
+              onChange={(e) => {
+                const newVal = e.target.value as 'LOW' | 'MEDIUM' | 'HIGH';
+                setLocalBuyEntrySettings(prev => prev ? { ...prev, maxAcceptableRiskLevel: newVal } : prev);
+                handleUpdateBuyEntrySettings({ maxAcceptableRiskLevel: newVal });
+              }}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#3b82f6]"
             >
               <option value="LOW">LOW</option>
@@ -618,17 +619,13 @@ export const PaperTradingPanel: React.FC = () => {
               <option value="HIGH">HIGH</option>
             </select>
           </div>
-
           <div className="flex flex-col">
-            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
-              Watch Window (Mins)
-            </label>
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">Watch Window (Mins)</label>
             <input
               type="number"
-              value={buyEntrySettings?.watchWindowMinutes ?? 15}
-              onChange={(e) =>
-                handleUpdateBuyEntrySettings({ watchWindowMinutes: parseInt(e.target.value, 10) || 1 })
-              }
+              value={localBuyEntrySettings?.watchWindowMinutes ?? 15}
+              onChange={(e) => setLocalBuyEntrySettings(prev => prev ? { ...prev, watchWindowMinutes: parseInt(e.target.value, 10) || 1 } : prev)}
+              onBlur={() => localBuyEntrySettings && handleUpdateBuyEntrySettings({ watchWindowMinutes: localBuyEntrySettings.watchWindowMinutes })}
               step={1}
               min={1}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#3b82f6]"
@@ -644,11 +641,11 @@ export const PaperTradingPanel: React.FC = () => {
                 Live Signal Watchlist ({watchlist.length})
               </span>
             </div>
+            {/* FIX #12: Corrected misleading text */}
             <span className="text-[9px] font-mono text-[#71717a]">
-              Auto-reevaluated every 30s
+              Server evaluates continuously
             </span>
           </div>
-
           <div className="overflow-x-auto max-h-[220px] overflow-y-auto scrollbar-thin scrollbar-thumb-[#27272a]">
             <table className="w-full text-left font-mono text-[10px]">
               <thead className="sticky top-0 bg-[#18181b] border-b border-[#27272a] text-[#71717a] uppercase text-[8px] z-10">
@@ -677,7 +674,6 @@ export const PaperTradingPanel: React.FC = () => {
                         : verdict?.verdict === 'WATCH' || verdict?.verdict === 'READY_TO_BUY'
                         ? 'bg-[#f59e0b]/15 text-[#f59e0b] border-[#f59e0b]/30'
                         : 'bg-[#ff4444]/15 text-[#ff4444] border-[#ff4444]/30';
-
                     return (
                       <tr key={`${item.sourceWalletAddress}:${item.tokenMint}`} className="hover:bg-[#27272a]/20">
                         <td className="py-1.5 px-2 font-bold text-[#3b82f6]">{item.tokenSymbol}</td>
@@ -714,11 +710,9 @@ export const PaperTradingPanel: React.FC = () => {
               <AlertTriangle className="w-5 h-5 text-[#ff4444]" />
               <h3 className="text-sm font-bold text-[#fafafa] uppercase font-mono">Reset Paper Account?</h3>
             </div>
-
             <p className="text-xs text-[#a1a1aa] mb-4">
               This will clear all open positions and trade history. All balances will be reset to the starting amount.
             </p>
-
             <div className="mb-4">
               <label className="text-[10px] text-[#71717a] font-mono uppercase block mb-1">
                 Starting Balance (SOL)
@@ -735,7 +729,6 @@ export const PaperTradingPanel: React.FC = () => {
                 <span className="text-xs text-[#71717a] font-bold">SOL</span>
               </div>
             </div>
-
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#27272a]">
               <button
                 onClick={() => setShowResetModal(false)}
@@ -772,7 +765,6 @@ export const PaperTradingPanel: React.FC = () => {
               Mirrored from Monitored Wallets
             </span>
           </div>
-
           <div className="overflow-x-auto">
             <table className="w-full text-left font-mono text-[10px]">
               <thead>
@@ -782,7 +774,7 @@ export const PaperTradingPanel: React.FC = () => {
                   <th className="py-1.5 px-2 text-right">Entry / Current</th>
                   <th className="py-1.5 px-2 text-center">TP / SL Targets</th>
                   <th className="py-1.5 px-2 text-right">Unrealized P&L</th>
-                  <th className="py-1.5 px-2 text-center">Status</th>
+                  <th className="py-1.5 px-2 text-center">Status / Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#27272a]/40">
@@ -842,9 +834,19 @@ export const PaperTradingPanel: React.FC = () => {
                           </span>
                         </td>
                         <td className="py-2 px-2 text-center">
-                          <span className="px-1.5 py-0.5 rounded text-[8px] font-bold bg-[#3b82f6]/20 text-[#3b82f6] border border-[#3b82f6]/30">
-                            {p.status || 'OPEN'}
-                          </span>
+                          <div className="flex flex-col items-center gap-1">
+                            <span className="px-1.5 py-0.5 rounded text-[8px] font-bold bg-[#3b82f6]/20 text-[#3b82f6] border border-[#3b82f6]/30">
+                              {p.status || 'OPEN'}
+                            </span>
+                            {/* FIX #10: Added Manual Exit Button */}
+                            <button
+                              onClick={() => handleManualExit(p.id)}
+                              className="px-1.5 py-0.5 rounded text-[8px] font-bold bg-[#ff4444]/15 text-[#ff4444] border border-[#ff4444]/30 hover:bg-[#ff4444]/25 transition-colors"
+                              title="Manually exit position at market price"
+                            >
+                              EXIT
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -855,7 +857,7 @@ export const PaperTradingPanel: React.FC = () => {
           </div>
         </div>
 
-        {/* Enhanced Paper Trade History - WITH SOLD AMOUNT & P&L */}
+        {/* Enhanced Paper Trade History */}
         <div className="rounded bg-[#18181b] border border-[#27272a] p-3 flex flex-col space-y-2">
           <div className="flex items-center justify-between pb-2 border-b border-[#27272a]">
             <div className="flex items-center gap-2">
@@ -866,7 +868,6 @@ export const PaperTradingPanel: React.FC = () => {
             </div>
             <span className="text-[10px] font-mono text-[#71717a]">Full Trade Details</span>
           </div>
-
           <div className="overflow-x-auto max-h-[400px] overflow-y-auto scrollbar-thin scrollbar-thumb-[#27272a]">
             <table className="w-full text-left font-mono text-[9px]">
               <thead className="sticky top-0 bg-[#18181b] border-b border-[#27272a] text-[#71717a] uppercase text-[8px] z-10">
@@ -895,26 +896,23 @@ export const PaperTradingPanel: React.FC = () => {
                     const timeStr = new Date(t.timestamp).toLocaleTimeString();
                     const isSell = t.action === 'SELL';
                     
-                    // Get corresponding position for entry price & hold time
-                    const position = positions.find(
-                      (p) => p.sourceWalletAddress === t.sourceWalletAddress && p.tokenMint === t.tokenMint
-                    );
-                    
+                    // FIX #9: Correctly map trade to its specific position using unique IDs
+                    const position = positions.find((p) => p.paperTradeId === t.id || p.sourceEventId === t.sourceEventId);
+
                     let holdTimeStr = '—';
                     if (isSell && position?.exitTimestamp) {
                       holdTimeStr = formatHoldTime(position.entryTimestamp, position.exitTimestamp);
                     }
-                    
+
                     const entryPrice = position?.avgEntryPriceSol || (isSell ? '—' : t.executionPriceSol);
-                    
-                    // For sell trades, try to find realized P&L from closed position
+
                     let pnlDisplay = '—';
                     let pnlColor = 'text-[#71717a]';
                     if (isSell && position?.status === 'CLOSED') {
                       pnlDisplay = `${position.realizedPnlSol >= 0 ? '+' : ''}${position.realizedPnlSol.toFixed(3)}`;
                       pnlColor = position.realizedPnlSol >= 0 ? 'text-[#00FF88]' : 'text-[#ff4444]';
                     }
-                    
+
                     return (
                       <tr key={t.id} className="hover:bg-[#27272a]/20 transition-colors">
                         <td className="py-1.5 px-1.5 text-[#71717a] text-[8px]">{timeStr}</td>
@@ -931,27 +929,19 @@ export const PaperTradingPanel: React.FC = () => {
                           </span>
                         </td>
                         <td className="py-1.5 px-1.5 font-bold text-[#3b82f6] text-[9px]">{t.tokenSymbol}</td>
-                        
-                        {/* Quantity Sold - NEW COLUMN */}
                         <td className="py-1.5 px-1.5 text-right text-[#e4e4e7]">
                           {formatTokenQuantity(t.tokenAmount)}
                         </td>
-                        
-                        {/* Fill Price */}
                         <td className="py-1.5 px-1.5 text-right text-[#e4e4e7]">
                           {t.executionPriceSol < 0.0001
                             ? t.executionPriceSol.toExponential(2)
                             : t.executionPriceSol.toFixed(6)}
                         </td>
-                        
-                        {/* SOL Amount */}
                         <td className={`py-1.5 px-1.5 text-right font-bold ${
                           t.action === 'BUY' ? 'text-[#ff9500]' : 'text-[#00FF88]'
                         }`}>
                           {t.solAmount.toFixed(3)}
                         </td>
-                        
-                        {/* Entry Price - NEW COLUMN (for SELL trades) */}
                         <td className="py-1.5 px-1.5 text-right text-[#71717a]">
                           {typeof entryPrice === 'number'
                             ? entryPrice < 0.0001
@@ -959,13 +949,9 @@ export const PaperTradingPanel: React.FC = () => {
                               : entryPrice.toFixed(6)
                             : entryPrice}
                         </td>
-                        
-                        {/* Realized P&L - NEW COLUMN (for SELL trades) */}
                         <td className={`py-1.5 px-1.5 text-right font-bold text-[8px] ${pnlColor}`}>
                           {pnlDisplay}
                         </td>
-                        
-                        {/* Hold Duration - NEW COLUMN */}
                         <td className="py-1.5 px-1.5 text-right text-[#71717a] text-[8px]">
                           {holdTimeStr}
                         </td>
@@ -993,7 +979,6 @@ export const PaperTradingPanel: React.FC = () => {
               Historical Performance Analysis
             </span>
           </div>
-
           <div className="overflow-x-auto">
             <table className="w-full text-left font-mono text-[10px]">
               <thead>
@@ -1014,7 +999,6 @@ export const PaperTradingPanel: React.FC = () => {
                 {closedPositions.map((p) => {
                   const holdTimeStr = formatHoldTime(p.entryTimestamp, p.exitTimestamp || p.lastTradeTimestamp);
                   const proceeds = p.realizedPnlSol + p.costBasisSol;
-                  
                   return (
                     <tr key={p.id} className="hover:bg-[#27272a]/20 transition-colors">
                       <td className="py-2 px-2 font-bold text-[#fafafa]">{p.traderName}</td>
