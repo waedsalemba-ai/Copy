@@ -33,6 +33,23 @@ export class LaserStreamService extends EventEmitter {
     this.startHeartbeat();
   }
 
+  public isRunning(): boolean {
+    return this.connected;
+  }
+
+  public startMonitoring(): void {
+    this.connect();
+    db.updateMetrics({ liveStreamRunning: true, laserstreamConnected: true });
+    console.log('[LaserStream] Live Monitoring Pipeline STARTED');
+  }
+
+  public stopMonitoring(): void {
+    this.disconnect();
+    this.queue = [];
+    db.updateMetrics({ liveStreamRunning: false, laserstreamConnected: false });
+    console.log('[LaserStream] Live Monitoring Pipeline STOPPED');
+  }
+
   public connect(): void {
     const settings = db.getSettings();
     this.connected = true;
@@ -40,6 +57,7 @@ export class LaserStreamService extends EventEmitter {
 
     db.updateMetrics({
       laserstreamConnected: true,
+      liveStreamRunning: true,
       laserstreamEndpoint: settings.laserstreamEndpoint,
     });
 
@@ -58,7 +76,8 @@ export class LaserStreamService extends EventEmitter {
     this.stopPolling();
     this.unsubscribeAll();
     this.monitoredWallets.clear();
-    db.updateMetrics({ laserstreamConnected: false });
+    this.queue = [];
+    db.updateMetrics({ laserstreamConnected: false, liveStreamRunning: false });
     eventBus.emit(SystemEvents.CONNECTION_STATUS_CHANGED, {
       laserstreamConnected: false,
       rpcConnected: db.getMetrics().rpcConnected,
@@ -98,7 +117,9 @@ export class LaserStreamService extends EventEmitter {
   }
 
   public subscribeWallet(address: string): void {
-    if (!this.connected) return;
+    if (!this.connected) {
+      this.connect();
+    }
     this.monitoredWallets.add(address);
 
     const isPublic = rpcService.isPublicCluster();
@@ -168,19 +189,26 @@ export class LaserStreamService extends EventEmitter {
     if (!this.connected || this.isPolling || this.monitoredWallets.size === 0) return;
     this.isPolling = true;
     try {
-      for (const address of this.monitoredWallets) {
-        try {
+      // Previously this awaited each wallet fully (RPC round-trip + a fixed
+      // 200ms pacing delay) one at a time, so total poll time scaled
+      // linearly with wallet count — past ~30 wallets a single pass no
+      // longer finished inside the 7s poll interval. The actual RPC pacing
+      // is already enforced centrally by rpcService's rate limiter (max 2
+      // concurrent calls, 150ms between dispatches), so fanning all wallets
+      // out via Promise.allSettled and letting that shared limiter do the
+      // throttling gets the same rate-limit safety without the per-wallet
+      // serialization.
+      const results = await Promise.allSettled(
+        Array.from(this.monitoredWallets).map(async (address) => {
           const pubkey = new PublicKey(address);
           const sigInfos = await rpcService.getSignaturesForAddress(pubkey, { limit: 2 });
           for (const sigInfo of sigInfos) {
             if (sigInfo.err) continue;
             this.enqueueSignature(address, sigInfo.signature);
           }
-        } catch {
-          // Ignore transient wallet polling error
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
+        })
+      );
+      void results; // individual failures are per-wallet and already non-fatal
     } catch {
       // Ignore polling errors
     } finally {
@@ -243,14 +271,24 @@ export class LaserStreamService extends EventEmitter {
 
   // --- Turning a log notification into a RawSolanaTransaction -------------
 
-  private async handleLogNotification(walletAddress: string, signature: string): Promise<void> {
+  private async handleLogNotification(walletAddress: string, signature: string): Promise<boolean> {
     const tx = await rpcService.getTransaction(signature);
-    if (!tx || !tx.meta) return;
+    if (!tx || !tx.meta) return false;
 
     const rawTx = this.buildRawTransaction(walletAddress, signature, tx);
-    if (!rawTx) return;
+    if (!rawTx) return false;
 
-    await this.ingestRawTransaction(rawTx);
+    return this.ingestRawTransaction(rawTx);
+  }
+
+  /**
+   * Fetch + classify + ingest a single already-known signature through the
+   * same pipeline the live queue uses. Exposed publicly so
+   * `historicalSyncService` can backfill a wallet's recent trades when it's
+   * first added, instead of only reacting to activity going forward.
+   */
+  public async processHistoricalTransaction(walletAddress: string, signature: string): Promise<boolean> {
+    return this.handleLogNotification(walletAddress, signature);
   }
 
   private buildRawTransaction(
@@ -295,8 +333,16 @@ export class LaserStreamService extends EventEmitter {
     // ui-amount-wise, than the destination token) wins the "biggest delta"
     // pick and the code reports the wallet as having "bought/sold SOL"
     // instead of the actual token.
-    const preBalances = (meta.preTokenBalances || []).filter((b) => b.owner === walletAddress);
-    const postBalances = (meta.postTokenBalances || []).filter((b) => b.owner === walletAddress);
+    const matchesWallet = (b: any) => {
+      if (b.owner === walletAddress) return true;
+      if (typeof b.accountIndex === 'number') {
+        const key = accountKeys.get(b.accountIndex)?.toBase58();
+        if (key === walletAddress) return true;
+      }
+      return false;
+    };
+    const preBalances = (meta.preTokenBalances || []).filter(matchesWallet);
+    const postBalances = (meta.postTokenBalances || []).filter(matchesWallet);
     const mints = new Set<string>([
       ...preBalances.map((b) => b.mint),
       ...postBalances.map((b) => b.mint),
@@ -368,7 +414,9 @@ export class LaserStreamService extends EventEmitter {
    * Primary Entry Point for Ingested Transactions from LaserStream stream
    */
   public async ingestRawTransaction(tx: RawSolanaTransaction): Promise<boolean> {
-    if (!this.connected) return false;
+    if (!this.connected) {
+      return false; // Live monitoring stopped by user
+    }
 
     const metrics = db.getMetrics();
     db.updateMetrics({

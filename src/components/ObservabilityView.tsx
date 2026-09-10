@@ -1,15 +1,5 @@
 import React from 'react';
-import {
-  Cpu,
-  Activity,
-  Zap,
-  Server,
-  Layers,
-  AlertOctagon,
-  RefreshCw,
-  Users,
-  ShieldCheck,
-} from 'lucide-react';
+import { Cpu } from 'lucide-react';
 import { SystemMetrics } from '../types';
 
 interface ObservabilityViewProps {

@@ -1,0 +1,21 @@
+--- a/src/server/paperTradingService.ts
++++ b/src/server/paperTradingService.ts
+@@ -218,10 +218,18 @@ export class PaperTradingService {
+       console.error('[PaperTrading] Live sell quote failed, using spot-price fallback:', err);
+     }
+ 
++    // Estimate price impact based on exit size and liquidity conditions
++    // Larger exits have more impact due to liquidity constraints
++    const liquidityImpactFactor = Math.min(
++      5, // Cap at 5% max estimated impact
++      Math.max(0.01, (params.quantity * params.spotPriceSol) / 10000) // Scales with position size
++    );
++
+     return {
+       fillPriceSol: params.spotPriceSol * (1 - params.baseSlippageBps / 10000),
+-      priceImpactPercent: 0.01,
++      priceImpactPercent: liquidityImpactFactor,
+     };
+   }
+ 
+   private handleTrade(trade: CanonicalTradeEvent): void {

@@ -6,10 +6,18 @@ import {
   deleteDoc,
   getDocs,
   collection,
+  disableNetwork,
+  terminate,
+  setLogLevel,
   Firestore,
 } from 'firebase/firestore';
 import fs from 'fs';
 import path from 'path';
+
+// Silence internal Firestore log messages completely on server
+try {
+  setLogLevel('silent');
+} catch {}
 import {
   TraderWallet,
   AppSettings,
@@ -42,6 +50,7 @@ try {
     const parsed = JSON.parse(raw);
     if (parsed.ts && Date.now() - parsed.ts < 18 * 60 * 60 * 1000) {
       isQuotaExceededServer = true;
+      setLogLevel('silent');
       console.warn('[Firebase Server] Persistent quota limit active. Auto-sync disabled; using local store.json.');
     } else {
       fs.unlinkSync(QUOTA_FILE);
@@ -66,8 +75,12 @@ function markServerQuotaExceeded(err: unknown): boolean {
         if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
         fs.writeFileSync(QUOTA_FILE, JSON.stringify({ ts: Date.now() }), 'utf-8');
       } catch {}
+      if (firestoreInstance) {
+        terminate(firestoreInstance).catch(() => disableNetwork(firestoreInstance)).catch(() => {});
+        firestoreInstance = null;
+      }
       console.warn(
-        '[Firebase Server] Firestore daily write quota limit reached (20,000 writes/day). Auto-sync paused; operating seamlessly on local store.json.'
+        '[Firebase Server] Firestore daily write quota limit reached (20,000 writes/day). Disabled gRPC network streams. Auto-sync operating seamlessly on local store.json.'
       );
     }
     return true;

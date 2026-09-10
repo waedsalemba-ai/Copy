@@ -9,7 +9,6 @@ import {
   Settings,
   Volume2,
   VolumeX,
-  Play,
   CheckCircle2,
   Zap,
   Repeat,
@@ -27,6 +26,8 @@ interface NavbarProps {
   setAudioEnabled: (val: boolean) => void;
   firebaseSynced?: boolean;
   quotaExceeded?: boolean;
+  onToggleLive?: () => void;
+  onTogglePaper?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -38,15 +39,13 @@ export const Navbar: React.FC<NavbarProps> = ({
   setAudioEnabled,
   firebaseSynced = true,
   quotaExceeded = false,
+  onToggleLive,
+  onTogglePaper,
 }) => {
   const tabs = [
-    { id: 'dashboard', label: 'Dashboard', icon: Activity },
-    { id: 'traders', label: 'Traders', icon: Users },
-    { id: 'trades', label: 'Live Trades', icon: TrendingUp },
-    { id: 'positions', label: 'Positions', icon: PieChart },
+    { id: 'live', label: 'Live Stream', icon: Activity },
     { id: 'paper', label: 'Paper Trading', icon: Repeat },
-    { id: 'alerts', label: 'Alerts', icon: Bell },
-    { id: 'observability', label: 'System Health', icon: Cpu },
+    { id: 'traders', label: 'Traders', icon: Users },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -114,6 +113,38 @@ export const Navbar: React.FC<NavbarProps> = ({
 
         {/* Quick Actions & Metrics */}
         <div className="flex items-center gap-2">
+          {/* Live Pipeline Switch */}
+          {onToggleLive && (
+            <button
+              onClick={onToggleLive}
+              title={metrics.liveStreamRunning !== false ? 'Live Stream Active (Click to Stop)' : 'Live Stream Stopped (Click to Start)'}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded font-mono text-[11px] border transition-all ${
+                metrics.liveStreamRunning !== false
+                  ? 'bg-[#00FF88]/15 border-[#00FF88]/40 text-[#00FF88]'
+                  : 'bg-[#27272a]/40 border-[#3f3f46] text-[#a1a1aa] hover:border-[#71717a]'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${metrics.liveStreamRunning !== false ? 'bg-[#00FF88] animate-pulse' : 'bg-[#71717a]'}`} />
+              <span className="font-bold">LIVE: {metrics.liveStreamRunning !== false ? 'RUNNING' : 'STOPPED'}</span>
+            </button>
+          )}
+
+          {/* Paper Pipeline Switch */}
+          {onTogglePaper && (
+            <button
+              onClick={onTogglePaper}
+              title={metrics.paperTradingRunning ? 'Paper Trading Active (Click to Stop)' : 'Paper Trading Stopped (Click to Start)'}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded font-mono text-[11px] border transition-all ${
+                metrics.paperTradingRunning
+                  ? 'bg-[#3b82f6]/15 border-[#3b82f6]/40 text-[#60a5fa]'
+                  : 'bg-[#27272a]/40 border-[#3f3f46] text-[#a1a1aa] hover:border-[#71717a]'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${metrics.paperTradingRunning ? 'bg-[#60a5fa] animate-pulse' : 'bg-[#71717a]'}`} />
+              <span className="font-bold">PAPER: {metrics.paperTradingRunning ? 'RUNNING' : 'STOPPED'}</span>
+            </button>
+          )}
+
           {/* Firebase Persistence Status */}
           <div
             title={

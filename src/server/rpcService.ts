@@ -1,14 +1,22 @@
 import { Connection, PublicKey, type VersionedTransactionResponse, type ConfirmedSignatureInfo } from '@solana/web3.js';
+import { WebSocket } from 'ws';
 import { db } from './db';
 import { config } from './config';
 
 // Rate limiter queue for outgoing RPC requests to prevent burst 429 errors
-class RpcRateLimiter {
+export class RpcRateLimiter {
   private queue: (() => Promise<void>)[] = [];
   private activeCount = 0;
-  private maxConcurrency = 2; // Maximum 2 concurrent RPC calls
-  private minIntervalMs = 150; // At least 150ms between initiating RPC calls
+  private maxConcurrency: number;
+  private minIntervalMs: number;
   private lastRequestTime = 0;
+  public readonly name: string;
+
+  constructor(name = 'default', maxConcurrency = 2, minIntervalMs = 150) {
+    this.name = name;
+    this.maxConcurrency = maxConcurrency;
+    this.minIntervalMs = minIntervalMs;
+  }
 
   public async acquire(): Promise<() => void> {
     return new Promise<() => void>((resolve) => {
@@ -37,6 +45,42 @@ class RpcRateLimiter {
     if (next) {
       next();
     }
+  }
+
+  public getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  public getActiveCount(): number {
+    return this.activeCount;
+  }
+}
+
+/**
+ * Dedicated Isolated RPC Pipeline Manager.
+ * Ensures Live stream ingestion and Paper trading never contend for the same rate limiter queues.
+ */
+export class IsolatedRpcManager {
+  constructor(
+    public readonly pipeline: 'live' | 'paper',
+    private service: RpcService
+  ) {}
+
+  public execute<T>(
+    operation: (conn: Connection) => Promise<T>,
+    description?: string,
+    maxRetries?: number
+  ): Promise<T> {
+    return this.service.executeRpcCall(
+      operation,
+      description || `${this.pipeline.toUpperCase()} RPC call`,
+      maxRetries,
+      this.pipeline
+    );
+  }
+
+  public getConnection(): Connection {
+    return this.service.getConnection();
   }
 }
 
@@ -155,6 +199,14 @@ const SEED_PRICE_TTL_MS = 0;
 const RPC_HEALTH_CHECK_INTERVAL_MS = 30_000;
 const RPC_HEALTH_CHECK_TIMEOUT_MS = 2_500;
 const RPC_CALL_TIMEOUT_MS = 4_000;
+// How often the live SOL/USD cross-rate (used as a fallback wherever a USD
+// price can't be derived directly) is refreshed in the background.
+const SOL_USD_REFRESH_INTERVAL_MS = 60_000;
+// Cap on the unbounded-growth metadata/price caches below — every unique
+// mint ever observed used to get its own permanent entry, which is a slow
+// memory leak on a long-running process. Oldest entries (Map insertion
+// order) are evicted once the cap is hit.
+const META_CACHE_MAX_ENTRIES = 3000;
 
 export class RpcService {
   private staticMetaCache = new Map<string, StaticTokenMeta>();
@@ -164,7 +216,14 @@ export class RpcService {
   private connections = new Map<string, Connection>();
   private endpointHealth = new Map<string, EndpointHealth>();
   private endpointCooldown = new Map<string, number>();
-  private rateLimiter = new RpcRateLimiter();
+  
+  // Strictly isolated rate limiters for Live Ingestion vs Paper Trading
+  public readonly liveRateLimiter = new RpcRateLimiter('live', 3, 100);
+  public readonly paperRateLimiter = new RpcRateLimiter('paper', 3, 80);
+
+  // Dedicated Pipeline Managers
+  public readonly live: IsolatedRpcManager;
+  public readonly paper: IsolatedRpcManager;
 
   // Immutable cache for confirmed transaction responses to avoid repeated network hits
   private txCache = new Map<string, { tx: VersionedTransactionResponse; cachedAt: number }>();
@@ -174,7 +233,18 @@ export class RpcService {
   private lastHealthCheckAt = 0;
   private healthCheckPromise: Promise<void> | null = null;
 
+  // Live SOL/USD cross-rate. Used as the fallback wherever a price source
+  // only gives a USD figure and we need to convert to SOL (or vice versa).
+  // Starts from the config constant (a fixed benchmark) but is kept fresh
+  // in the background via Jupiter so it doesn't silently drift from the
+  // real market price the way a hardcoded constant would.
+  private solPriceUsd = config.solPriceUsd;
+  private solPriceUpdatedAt = 0;
+  private solPriceRefreshTimer: NodeJS.Timeout | null = null;
+
   constructor() {
+    this.live = new IsolatedRpcManager('live', this);
+    this.paper = new IsolatedRpcManager('paper', this);
     // Seed known tokens: symbol/decimals/name are structural and safe to cache
     // indefinitely, but priceSol is a live market value, so it's seeded as
     // already-stale (fetchedAt: 0) except SOL, which is always exactly 1 SOL.
@@ -185,6 +255,73 @@ export class RpcService {
         fetchedAt: mint === SOL_MINT ? Infinity : SEED_PRICE_TTL_MS,
       });
     });
+
+    this.refreshSolUsdPrice().catch(() => {});
+    this.solPriceRefreshTimer = setInterval(() => {
+      this.refreshSolUsdPrice().catch(() => {});
+    }, SOL_USD_REFRESH_INTERVAL_MS);
+  }
+
+  /** Current best-known live SOL/USD price (never the stale config constant once a live read has landed). */
+  public getSolPriceUsd(): number {
+    return this.solPriceUsd > 0 ? this.solPriceUsd : config.solPriceUsd;
+  }
+
+  private jupiterCooldownUntil = 0;
+
+  private handleJupiter429(status: number, context: string): void {
+    if (status === 429) {
+      const wasInCooldown = Date.now() < this.jupiterCooldownUntil;
+      this.jupiterCooldownUntil = Date.now() + 60_000;
+      if (!wasInCooldown) {
+        console.info(`[Jupiter API] Rate limit hit (HTTP 429) during ${context}. Pausing Jupiter API requests for 60s and using DexScreener/cached prices.`);
+      }
+    }
+  }
+
+  private async refreshSolUsdPrice(): Promise<void> {
+    if (Date.now() < this.jupiterCooldownUntil) return;
+
+    try {
+      const apiKey = db.getSettings().jupiterApiKey?.trim();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
+      const res = await fetch(`${JUPITER_API_BASE}/price/v3?ids=${SOL_MINT}`, {
+        signal: controller.signal,
+        headers: apiKey ? { 'x-api-key': apiKey } : undefined,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        if (res.status === 429) {
+          this.handleJupiter429(res.status, 'SOL price refresh');
+        } else {
+          const body = await res.text().catch(() => '');
+          console.warn(`[Jupiter] SOL price fetch failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+        }
+        return;
+      }
+      const data = await res.json();
+      const usd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
+      if (usd > 0) {
+        this.solPriceUsd = usd;
+        this.solPriceUpdatedAt = Date.now();
+      } else {
+        console.warn('[Jupiter] SOL price fetch returned no usable price:', JSON.stringify(data).slice(0, 200));
+      }
+    } catch (err) {
+      console.warn('[Jupiter] SOL price fetch threw:', err instanceof Error ? err.message : err);
+      // Keep the last known value (or the config fallback) on failure.
+    }
+  }
+
+  // Evicts the oldest entries (Map insertion order) once a cache exceeds
+  // its cap, so caches keyed by "every mint ever seen" don't grow forever.
+  private evictOldestIfNeeded<K, V>(cache: Map<K, V>, maxEntries: number): void {
+    while (cache.size > maxEntries) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      cache.delete(oldestKey);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -197,9 +334,9 @@ export class RpcService {
   private getConfiguredEndpoints(): string[] {
     const settings = db.getSettings();
     const fromSettings = (settings.rpcUrl || '').split(',').map((u) => u.trim()).filter(Boolean);
-    const merged = [...fromSettings, ...config.rpcFallbackUrls, 'https://api.mainnet-beta.solana.com'];
+    const merged = [...fromSettings, ...config.rpcFallbackUrls, 'https://solana-rpc.publicnode.com', 'https://api.mainnet-beta.solana.com'];
     const deduped = Array.from(new Set(merged));
-    return deduped.length > 0 ? deduped : ['https://api.mainnet-beta.solana.com'];
+    return deduped.length > 0 ? deduped : ['https://solana-rpc.publicnode.com', 'https://api.mainnet-beta.solana.com'];
   }
 
   private getOrCreateConnection(url: string): Connection {
@@ -330,7 +467,7 @@ export class RpcService {
 
   public isPublicCluster(url?: string): boolean {
     const target = url || this.activeUrl || db.getSettings().rpcUrl;
-    return target.includes('api.mainnet-beta.solana.com') || target.includes('solana.com');
+    return target.includes('api.mainnet-beta.solana.com') || target.includes('solana.com') || target.includes('publicnode.com');
   }
 
   public validateAddress(address: string): boolean {
@@ -369,13 +506,99 @@ export class RpcService {
     }
   }
 
+  /**
+   * Tests a specific RPC endpoint directly and measures real latency and block slot.
+   * Ensures granular, isolated test feedback.
+   */
+  public async testEndpoint(url: string): Promise<{ ok: boolean; latencyMs: number; slot?: number; error?: string }> {
+    const start = Date.now();
+    try {
+      if (!url || !url.startsWith('http')) {
+        return { ok: false, latencyMs: 0, error: 'Invalid RPC HTTP/HTTPS URL' };
+      }
+      const conn = new Connection(url, { commitment: 'confirmed' });
+      const slot = await Promise.race([
+        conn.getSlot('confirmed'),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Connection timeout (5000ms)')), 5000)),
+      ]);
+      return { ok: true, latencyMs: Date.now() - start, slot };
+    } catch (err: any) {
+      return { ok: false, latencyMs: Date.now() - start, error: err?.message || 'RPC endpoint unreachable' };
+    }
+  }
+
+  /**
+   * Tests Jupiter Price/Quote API independently.
+   * If key is provided or configured, validates format (must start with JUP) and passes header.
+   */
+  public async testJupiterApi(key?: string): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+    const start = Date.now();
+    try {
+      const apiKey = (key ?? db.getSettings().jupiterApiKey ?? config.jupiterApiKey ?? '').trim();
+      if (apiKey && !apiKey.toUpperCase().startsWith('JUP')) {
+        return { ok: false, latencyMs: 0, error: 'Jupiter API Key must start with "JUP"' };
+      }
+      const headers: Record<string, string> = { Accept: 'application/json' };
+      if (apiKey) {
+        headers['x-api-key'] = apiKey;
+      }
+      const res = await fetch('https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112', {
+        headers,
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          return { ok: false, latencyMs: Date.now() - start, error: `Invalid Jupiter API Key (HTTP ${res.status})` };
+        }
+      }
+      return { ok: true, latencyMs: Date.now() - start };
+    } catch (err: any) {
+      return { ok: false, latencyMs: Date.now() - start, error: err?.message || 'Failed to connect to Jupiter API' };
+    }
+  }
+
+  /**
+   * Tests a Solana WSS connection and handshake independently.
+   */
+  public async testWssConnection(url: string): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
+    const start = Date.now();
+    if (!url || (!url.startsWith('ws://') && !url.startsWith('wss://'))) {
+      return { ok: false, latencyMs: 0, error: 'Invalid WebSocket URL (must start with wss:// or ws://)' };
+    }
+    return new Promise<{ ok: boolean; latencyMs: number; error?: string }>((resolve) => {
+      try {
+        const ws = new WebSocket(url);
+        const timer = setTimeout(() => {
+          try { ws.close(); } catch {}
+          resolve({ ok: false, latencyMs: 5000, error: 'WebSocket connection timeout (5000ms)' });
+        }, 5000);
+
+        ws.on('open', () => {
+          clearTimeout(timer);
+          const latency = Date.now() - start;
+          try { ws.close(); } catch {}
+          resolve({ ok: true, latencyMs: latency });
+        });
+
+        ws.on('error', (err: any) => {
+          clearTimeout(timer);
+          resolve({ ok: false, latencyMs: Date.now() - start, error: err?.message || 'WebSocket handshake failed' });
+        });
+      } catch (err: any) {
+        resolve({ ok: false, latencyMs: Date.now() - start, error: err?.message || 'Failed to initialize WebSocket' });
+      }
+    });
+  }
+
   // Core RPC execution wrapper with rate limiting, retry backoff on 429, and endpoint failover
   public async executeRpcCall<T>(
     operation: (conn: Connection) => Promise<T>,
     description = 'RPC call',
-    maxRetries = 3
+    maxRetries = 3,
+    pipeline: 'live' | 'paper' = 'live'
   ): Promise<T> {
-    const release = await this.rateLimiter.acquire();
+    const limiter = pipeline === 'paper' ? this.paperRateLimiter : this.liveRateLimiter;
+    const release = await limiter.acquire();
     try {
       let lastError: any = null;
 
@@ -423,6 +646,18 @@ export class RpcService {
     } finally {
       release();
     }
+  }
+
+  /**
+   * Dedicated RPC execution method for Paper Trading operations.
+   * Runs on the isolated paperRateLimiter queue.
+   */
+  public async executePaperRpcCall<T>(
+    operation: (conn: Connection) => Promise<T>,
+    description = 'Paper RPC call',
+    maxRetries = 3
+  ): Promise<T> {
+    return this.executeRpcCall(operation, description, maxRetries, 'paper');
   }
 
   /**
@@ -559,18 +794,99 @@ export class RpcService {
     return fetchPromise;
   }
 
-  // Fetches prices for many mints in parallel (deduped) instead of the
-  // caller awaiting them one at a time in a loop.
+  private async fetchPricesFromJupiterBatch(mints: string[]): Promise<Map<string, number>> {
+    const result = new Map<string, number>();
+    if (Date.now() < this.jupiterCooldownUntil || mints.length === 0) {
+      return result;
+    }
+
+    const validMints = Array.from(new Set(mints.filter((m) => m && m !== 'UNKNOWN' && m !== SOL_MINT)));
+    if (validMints.length === 0) return result;
+
+    const chunkSize = 50;
+    for (let i = 0; i < validMints.length; i += chunkSize) {
+      if (Date.now() < this.jupiterCooldownUntil) break;
+      const chunk = validMints.slice(i, i + chunkSize);
+      const ids = [...chunk, SOL_MINT].join(',');
+
+      try {
+        const apiKey = db.getSettings().jupiterApiKey?.trim();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
+        const res = await fetch(`${JUPITER_API_BASE}/price/v3?ids=${ids}`, {
+          signal: controller.signal,
+          headers: apiKey ? { 'x-api-key': apiKey } : undefined,
+        });
+        clearTimeout(timeoutId);
+
+        if (!res.ok) {
+          if (res.status === 429) {
+            this.handleJupiter429(res.status, 'batch price fetch');
+          } else {
+            const body = await res.text().catch(() => '');
+            console.warn(`[Jupiter] Batch price fetch failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+          }
+          continue;
+        }
+
+        const data = await res.json();
+        const solUsd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
+        if (solUsd > 0) {
+          this.solPriceUsd = solUsd;
+          this.solPriceUpdatedAt = Date.now();
+        }
+
+        const solRate = solUsd > 0 ? solUsd : this.getSolPriceUsd();
+
+        for (const mint of chunk) {
+          const tokenUsd = parseFloat(data?.data?.[mint]?.usdPrice ?? data?.[mint]?.usdPrice);
+          if (tokenUsd > 0 && solRate > 0) {
+            const priceSol = tokenUsd / solRate;
+            this.priceCache.set(mint, { priceSol, fetchedAt: Date.now() });
+            this.evictOldestIfNeeded(this.priceCache, META_CACHE_MAX_ENTRIES);
+            result.set(mint, priceSol);
+          }
+        }
+      } catch {
+        // Quiet fallback on network error
+      }
+    }
+
+    return result;
+  }
+
+  // Fetches prices for many mints in a single Jupiter batch call, falling back to DexScreener if needed.
   public async getPricesBatch(tokenMints: string[]): Promise<Map<string, TokenInfo>> {
     const uniqueMints = Array.from(new Set(tokenMints.filter((m) => m && m !== 'UNKNOWN')));
-    const results = await Promise.allSettled(uniqueMints.map((mint) => this.getTokenMetadata(mint)));
+    if (uniqueMints.length === 0) return new Map();
+
+    const staleMints = uniqueMints.filter((m) => !this.isPriceFresh(m));
+    if (staleMints.length > 0 && Date.now() >= this.jupiterCooldownUntil) {
+      await this.fetchPricesFromJupiterBatch(staleMints);
+    }
 
     const out = new Map<string, TokenInfo>();
-    results.forEach((r, i) => {
-      if (r.status === 'fulfilled') {
-        out.set(uniqueMints[i], r.value);
+    const unfulfilledMints: string[] = [];
+
+    for (const mint of uniqueMints) {
+      const staticMeta = this.staticMetaCache.get(mint);
+      const cachedPrice = this.priceCache.get(mint)?.priceSol;
+      if (staticMeta && cachedPrice !== undefined && this.isPriceFresh(mint)) {
+        out.set(mint, { ...staticMeta, priceSol: cachedPrice });
+      } else {
+        unfulfilledMints.push(mint);
       }
-    });
+    }
+
+    if (unfulfilledMints.length > 0) {
+      const fallbackResults = await Promise.allSettled(unfulfilledMints.map((mint) => this.getTokenMetadata(mint)));
+      fallbackResults.forEach((r, i) => {
+        if (r.status === 'fulfilled') {
+          out.set(unfulfilledMints[i], r.value);
+        }
+      });
+    }
+
     return out;
   }
 
@@ -580,7 +896,10 @@ export class RpcService {
     if (staticMeta) {
       // Symbol/decimals/name already known — only the price needs refreshing,
       // so use the lighter/faster Jupiter price endpoint first.
-      const price = await this.fetchPriceFromJupiter(tokenMint);
+      let price: number | null = null;
+      if (Date.now() >= this.jupiterCooldownUntil) {
+        price = await this.fetchPriceFromJupiter(tokenMint);
+      }
       if (price !== null) {
         info = { ...staticMeta, priceSol: price };
       } else {
@@ -589,13 +908,20 @@ export class RpcService {
       }
     } else {
       // First time seeing this mint — need full metadata (symbol/decimals/name),
-      // which only DexScreener gives us here.
-      info = await this.fetchFromDexScreener(tokenMint);
-      if (!info) {
-        const price = await this.fetchPriceFromJupiter(tokenMint);
-        if (price !== null) {
-          info = { symbol: 'UNKNOWN', decimals: 6, name: 'Unknown Token', priceSol: price };
-        }
+      // which only DexScreener gives us, AND we still want Jupiter's price
+      // (more reliable / lower-latency) rather than DexScreener's if both
+      // are available.
+      const fetchJup = Date.now() >= this.jupiterCooldownUntil
+        ? this.fetchPriceFromJupiter(tokenMint)
+        : Promise.resolve(null);
+      const [dex, jupPrice] = await Promise.all([
+        this.fetchFromDexScreener(tokenMint),
+        fetchJup,
+      ]);
+      if (dex) {
+        info = jupPrice !== null ? { ...dex, priceSol: jupPrice } : dex;
+      } else if (jupPrice !== null) {
+        info = { symbol: 'UNKNOWN', decimals: 6, name: 'Unknown Token', priceSol: jupPrice };
       }
     }
 
@@ -617,6 +943,8 @@ export class RpcService {
 
     this.staticMetaCache.set(tokenMint, { symbol: info.symbol, decimals: info.decimals, name: info.name });
     this.priceCache.set(tokenMint, { priceSol: info.priceSol, fetchedAt: Date.now() });
+    this.evictOldestIfNeeded(this.staticMetaCache, META_CACHE_MAX_ENTRIES);
+    this.evictOldestIfNeeded(this.priceCache, META_CACHE_MAX_ENTRIES);
     return info;
   }
 
@@ -638,6 +966,8 @@ export class RpcService {
   // a much lower rate limit that can start failing outright, silently
   // falling back to the DexScreener path below.
   private async fetchPriceFromJupiter(tokenMint: string): Promise<number | null> {
+    if (Date.now() < this.jupiterCooldownUntil) return null;
+
     try {
       const apiKey = db.getSettings().jupiterApiKey?.trim();
       const controller = new AbortController();
@@ -647,16 +977,34 @@ export class RpcService {
         headers: apiKey ? { 'x-api-key': apiKey } : undefined,
       });
       clearTimeout(timeoutId);
-      if (!res.ok) return null;
+      if (!res.ok) {
+        if (res.status === 429) {
+          this.handleJupiter429(res.status, `single fetch for ${tokenMint}`);
+        } else {
+          const body = await res.text().catch(() => '');
+          console.warn(`[Jupiter] price fetch failed for ${tokenMint}: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+        }
+        return null;
+      }
 
       const data = await res.json();
-      const tokenUsd = parseFloat(data?.data?.[tokenMint]?.usdPrice);
-      if (!(tokenUsd > 0)) return null;
+      const tokenUsd = parseFloat(data?.data?.[tokenMint]?.usdPrice ?? data?.[tokenMint]?.usdPrice);
+      if (!(tokenUsd > 0)) {
+        console.warn(`[Jupiter] price fetch for ${tokenMint} returned no usable price:`, JSON.stringify(data).slice(0, 200));
+        return null;
+      }
 
-      const solUsd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice);
-      const priceSol = solUsd > 0 ? tokenUsd / solUsd : tokenUsd / config.solPriceUsd;
+      const solUsd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
+      if (solUsd > 0) {
+        // Opportunistically keep the live SOL/USD rate fresh off the back
+        // of this call instead of only refreshing it on its own timer.
+        this.solPriceUsd = solUsd;
+        this.solPriceUpdatedAt = Date.now();
+      }
+      const priceSol = solUsd > 0 ? tokenUsd / solUsd : tokenUsd / this.getSolPriceUsd();
       return priceSol > 0 ? priceSol : null;
-    } catch {
+    } catch (err) {
+      console.warn(`[Jupiter] price fetch for ${tokenMint} threw:`, err instanceof Error ? err.message : err);
       return null;
     }
   }
@@ -676,8 +1024,12 @@ export class RpcService {
     slippageBps = 50
   ): Promise<{ outAmountRawUnits: number; priceImpactPct: number } | null> {
     if (!(amountRawUnits > 0)) return null;
+    if (Date.now() < this.jupiterCooldownUntil) return null;
     const apiKey = db.getSettings().jupiterApiKey?.trim();
-    if (!apiKey) return null;
+    if (!apiKey) {
+      console.warn('[Jupiter] getExecutionQuote skipped: no Jupiter API key configured in Settings');
+      return null;
+    }
 
     try {
       const controller = new AbortController();
@@ -689,14 +1041,26 @@ export class RpcService {
         headers: { 'x-api-key': apiKey },
       });
       clearTimeout(timeoutId);
-      if (!res.ok) return null;
+      if (!res.ok) {
+        if (res.status === 429) {
+          this.handleJupiter429(res.status, 'execution quote');
+        } else {
+          const body = await res.text().catch(() => '');
+          console.warn(`[Jupiter] execution quote failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
+        }
+        return null;
+      }
 
       const data = await res.json();
       const outAmountRawUnits = parseFloat(data?.outAmount);
-      if (!(outAmountRawUnits > 0)) return null;
+      if (!(outAmountRawUnits > 0)) {
+        console.warn('[Jupiter] execution quote returned no usable outAmount:', JSON.stringify(data).slice(0, 200));
+        return null;
+      }
       const priceImpactPct = parseFloat(data?.priceImpactPct) || 0;
       return { outAmountRawUnits, priceImpactPct };
-    } catch {
+    } catch (err) {
+      console.warn('[Jupiter] execution quote threw:', err instanceof Error ? err.message : err);
       return null;
     }
   }
@@ -736,8 +1100,8 @@ export class RpcService {
       }
       if (priceSol === null) {
         const priceUsd = parseFloat(anyMatch.priceUsd);
-        if (priceUsd > 0 && config.solPriceUsd > 0) {
-          priceSol = priceUsd / config.solPriceUsd;
+        if (priceUsd > 0 && this.getSolPriceUsd() > 0) {
+          priceSol = priceUsd / this.getSolPriceUsd();
         }
       }
       if (priceSol === null) return null;

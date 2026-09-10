@@ -13,6 +13,7 @@ import {
   Check,
 } from 'lucide-react';
 import { PaperAccount, PaperPosition, PaperTrade, CopyTradeSettings, BuyEntrySettings, BuyEntryVerdict } from '../types';
+import { formatTokenQuantity, formatSol } from '../utils/formatters';
 
 interface PaperAccountResponse extends PaperAccount {
   openPositionsValueSol: number;
@@ -46,11 +47,12 @@ export const PaperTradingPanel: React.FC = () => {
   const [buyEntrySettings, setBuyEntrySettings] = useState<BuyEntrySettings | null>(null);
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
 
-  // Reset confirmation state
+  // Reset confirmation and error states
   const [showResetModal, setShowResetModal] = useState(false);
   const [resetBalance, setResetBalance] = useState<number>(10);
   const [isResetting, setIsResetting] = useState(false);
   const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
+  const [actionErrorMsg, setActionErrorMsg] = useState<string | null>(null);
 
   const fetchPaperData = async () => {
     try {
@@ -85,30 +87,114 @@ export const PaperTradingPanel: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  const postWithRetry = async (url: string, options: RequestInit = {}, retries = 1): Promise<Response> => {
+    let lastErr: any = null;
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const res = await fetch(url, options);
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (i < retries) {
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+    }
+    throw lastErr || new Error('Network error');
+  };
+
   const handleUpdateSettings = async (updates: Partial<CopyTradeSettings>) => {
     if (!settings) return;
+    setActionErrorMsg(null);
     try {
-      const res = await fetch('/api/paper/settings', {
+      const res = await postWithRetry('/api/paper/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...settings, ...updates }),
       });
+      const contentType = res.headers.get('Content-Type') || '';
+      if (res.ok) {
+        if (contentType.includes('application/json')) {
+          const updated = await res.json();
+          setSettings(updated);
+          if (updates.startingVirtualSolBalance) {
+            setResetBalance(updates.startingVirtualSolBalance);
+          }
+        } else {
+          const text = await res.text();
+          console.error('[PaperTradingPanel] Received non-JSON response on update settings:', text.slice(0, 300));
+          setActionErrorMsg('Failed to update settings: Server returned unexpected HTML content');
+        }
+      } else {
+        let errMsg = res.statusText;
+        if (contentType.includes('application/json')) {
+          const errJson = await res.json().catch(() => null);
+          if (errJson?.error) errMsg = errJson.error;
+        } else {
+          const text = await res.text().catch(() => '');
+          if (text) errMsg = text.slice(0, 100);
+        }
+        setActionErrorMsg(`Failed to update settings: ${errMsg}`);
+      }
+    } catch (err: any) {
+      console.error('Failed to update paper settings:', err);
+      setActionErrorMsg(`Failed to update settings: ${err?.message || 'Network error'}`);
+    }
+  };
+
+  const [isTogglingCopyTrading, setIsTogglingCopyTrading] = useState(false);
+
+  const handleStartCopyTrading = async () => {
+    setIsTogglingCopyTrading(true);
+    setActionErrorMsg(null);
+    try {
+      const res = await postWithRetry('/api/paper/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
       if (res.ok) {
         const updated = await res.json();
         setSettings(updated);
-        if (updates.startingVirtualSolBalance) {
-          setResetBalance(updates.startingVirtualSolBalance);
-        }
+      } else {
+        const errJson = await res.json().catch(() => null);
+        setActionErrorMsg(`Failed to start copy trading: ${errJson?.error || res.statusText}`);
       }
-    } catch (err) {
-      console.error('Failed to update paper settings:', err);
+    } catch (err: any) {
+      console.error('Failed to start copy trading:', err);
+      setActionErrorMsg(`Failed to start copy trading: ${err?.message || 'Network error'}`);
+    } finally {
+      setIsTogglingCopyTrading(false);
+    }
+  };
+
+  const handleStopCopyTrading = async () => {
+    setIsTogglingCopyTrading(true);
+    setActionErrorMsg(null);
+    try {
+      const res = await postWithRetry('/api/paper/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setSettings(updated);
+      } else {
+        const errJson = await res.json().catch(() => null);
+        setActionErrorMsg(`Failed to stop copy trading: ${errJson?.error || res.statusText}`);
+      }
+    } catch (err: any) {
+      console.error('Failed to stop copy trading:', err);
+      setActionErrorMsg(`Failed to stop copy trading: ${err?.message || 'Network error'}`);
+    } finally {
+      setIsTogglingCopyTrading(false);
     }
   };
 
   const handleUpdateBuyEntrySettings = async (updates: Partial<BuyEntrySettings>) => {
     if (!buyEntrySettings) return;
+    setActionErrorMsg(null);
     try {
-      const res = await fetch('/api/buy-entry/settings', {
+      const res = await postWithRetry('/api/buy-entry/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...buyEntrySettings, ...updates }),
@@ -116,9 +202,13 @@ export const PaperTradingPanel: React.FC = () => {
       if (res.ok) {
         const updated = await res.json();
         setBuyEntrySettings(updated);
+      } else {
+        const errJson = await res.json().catch(() => null);
+        setActionErrorMsg(`Failed to update buy entry settings: ${errJson?.error || res.statusText}`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to update buy entry settings:', err);
+      setActionErrorMsg(`Failed to update buy entry settings: ${err?.message || 'Network error'}`);
     }
   };
 
@@ -129,8 +219,9 @@ export const PaperTradingPanel: React.FC = () => {
 
   const handleExecuteReset = async () => {
     setIsResetting(true);
+    setActionErrorMsg(null);
     try {
-      const res = await fetch('/api/paper/reset', {
+      const res = await postWithRetry('/api/paper/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ startingBalance: resetBalance }),
@@ -140,9 +231,13 @@ export const PaperTradingPanel: React.FC = () => {
         setShowResetModal(false);
         setResetSuccessMsg('Paper account reset successfully!');
         setTimeout(() => setResetSuccessMsg(null), 3000);
+      } else {
+        const errJson = await res.json().catch(() => null);
+        setActionErrorMsg(`Failed to reset paper account: ${errJson?.error || res.statusText}`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to reset paper account:', err);
+      setActionErrorMsg(`Failed to reset paper account: ${err?.message || 'Network error'}`);
     } finally {
       setIsResetting(false);
     }
@@ -194,6 +289,19 @@ export const PaperTradingPanel: React.FC = () => {
         </div>
       )}
 
+      {/* Action Error Banner */}
+      {actionErrorMsg && (
+        <div className="p-2.5 rounded bg-[#ff4444]/10 border border-[#ff4444]/30 text-[#ff4444] text-xs font-mono flex items-center justify-between animate-fade-in">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-[#ff4444] shrink-0" />
+            <span>{actionErrorMsg}</span>
+          </div>
+          <button onClick={() => setActionErrorMsg(null)} className="hover:text-white">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Top Header Stat Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
         <div className="p-3 rounded bg-[#18181b] border border-[#27272a] shadow-sm flex flex-col justify-between">
@@ -202,7 +310,7 @@ export const PaperTradingPanel: React.FC = () => {
             <Wallet className="w-3.5 h-3.5 text-[#00FF88]" />
           </div>
           <div className="mt-2 text-lg font-bold font-mono text-[#fafafa]">
-            {account ? `${account.virtualSolBalance.toFixed(3)} SOL` : '—'}
+            {account ? formatSol(account.virtualSolBalance, 3) : '—'}
           </div>
           <div className="text-[10px] text-[#71717a] font-mono mt-0.5">
             Initial: {account ? `${account.startingVirtualSolBalance} SOL` : '—'}
@@ -215,7 +323,7 @@ export const PaperTradingPanel: React.FC = () => {
             <Layers className="w-3.5 h-3.5 text-[#3b82f6]" />
           </div>
           <div className="mt-2 text-lg font-bold font-mono text-[#3b82f6]">
-            {account ? `${account.openPositionsValueSol.toFixed(3)} SOL` : '—'}
+            {account ? formatSol(account.openPositionsValueSol, 3) : '—'}
           </div>
           <div className="text-[10px] text-[#71717a] font-mono mt-0.5">
             {openPositions.length} active position{openPositions.length === 1 ? '' : 's'}
@@ -228,7 +336,7 @@ export const PaperTradingPanel: React.FC = () => {
             <DollarSign className="w-3.5 h-3.5 text-[#e4e4e7]" />
           </div>
           <div className="mt-2 text-lg font-bold font-mono text-[#fafafa]">
-            {account ? `${account.totalEquitySol.toFixed(3)} SOL` : '—'}
+            {account ? formatSol(account.totalEquitySol, 3) : '—'}
           </div>
           <div className="text-[10px] font-mono mt-0.5 text-[#a1a1aa]">
             Liquid + Position Value
@@ -249,9 +357,7 @@ export const PaperTradingPanel: React.FC = () => {
               account && account.totalRealizedPnlSol >= 0 ? 'text-[#00FF88]' : 'text-[#ff4444]'
             }`}
           >
-            {account
-              ? `${account.totalRealizedPnlSol >= 0 ? '+' : ''}${account.totalRealizedPnlSol.toFixed(3)} SOL`
-              : '—'}
+            {account ? formatSol(account.totalRealizedPnlSol, 3, true) : '—'}
           </div>
           <div className="text-[10px] font-mono mt-0.5 text-[#a1a1aa]">
             {closedPositions.length} trade{closedPositions.length === 1 ? '' : 's'} closed
@@ -280,17 +386,29 @@ export const PaperTradingPanel: React.FC = () => {
             <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1">
               Copy Trading
             </label>
-            <label className="flex items-center gap-2 cursor-pointer mt-1">
-              <input
-                type="checkbox"
-                checked={settings?.enabled || false}
-                onChange={(e) => handleUpdateSettings({ enabled: e.target.checked })}
-                className="w-4 h-4 accent-[#00FF88]"
-              />
-              <span className="text-[11px] text-[#fafafa] font-mono font-bold">
-                {settings?.enabled ? 'Enabled' : 'Disabled'}
+            <div className="flex items-center gap-2 mt-1">
+              <button
+                onClick={handleStartCopyTrading}
+                disabled={isTogglingCopyTrading || !!settings?.enabled}
+                className="px-2.5 py-1 rounded bg-[#00FF88] hover:bg-[#00e67a] disabled:opacity-40 disabled:cursor-not-allowed text-black text-[11px] font-mono font-bold transition-all"
+              >
+                Start
+              </button>
+              <button
+                onClick={handleStopCopyTrading}
+                disabled={isTogglingCopyTrading || !settings?.enabled}
+                className="px-2.5 py-1 rounded bg-[#ef4444] hover:bg-[#dc2626] disabled:opacity-40 disabled:cursor-not-allowed text-white text-[11px] font-mono font-bold transition-all"
+              >
+                Stop
+              </button>
+              <span
+                className={`text-[11px] font-mono font-bold ${
+                  settings?.enabled ? 'text-[#00FF88]' : 'text-[#71717a]'
+                }`}
+              >
+                {settings?.enabled ? 'Running' : 'Stopped'}
               </span>
-            </label>
+            </div>
           </div>
 
           <div className="flex flex-col">
@@ -361,6 +479,76 @@ export const PaperTradingPanel: React.FC = () => {
               min={0.1}
               className="px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88]"
             />
+          </div>
+
+          <div className="flex flex-col justify-end">
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1 flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={settings?.confidenceSizingEnabled ?? false}
+                onChange={(e) => handleUpdateSettings({ confidenceSizingEnabled: e.target.checked })}
+                className="accent-[#00FF88]"
+              />
+              Confidence Sizing
+            </label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                value={settings?.minSizeMultiplier ?? 0.4}
+                onChange={(e) => handleUpdateSettings({ minSizeMultiplier: parseFloat(e.target.value) || 0.1 })}
+                step={0.1}
+                min={0.1}
+                disabled={!settings?.confidenceSizingEnabled}
+                title="Min size multiplier (lowest-confidence trades)"
+                className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
+              />
+              <span className="text-[#71717a] text-[10px]">–</span>
+              <input
+                type="number"
+                value={settings?.maxSizeMultiplier ?? 1.75}
+                onChange={(e) => handleUpdateSettings({ maxSizeMultiplier: parseFloat(e.target.value) || 1 })}
+                step={0.1}
+                min={1}
+                disabled={!settings?.confidenceSizingEnabled}
+                title="Max size multiplier (highest-confidence trades)"
+                className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#fafafa] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-col justify-end">
+            <label className="text-[10px] text-[#71717a] font-mono uppercase mb-1 flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={settings?.trailingStopEnabled ?? false}
+                onChange={(e) => handleUpdateSettings({ trailingStopEnabled: e.target.checked })}
+                className="accent-[#00FF88]"
+              />
+              Trailing Stop
+            </label>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                value={settings?.trailingActivationPercent ?? 15}
+                onChange={(e) => handleUpdateSettings({ trailingActivationPercent: parseFloat(e.target.value) || 1 })}
+                step={1}
+                min={1}
+                disabled={!settings?.trailingStopEnabled}
+                title="Activate trailing once gain reaches this %"
+                className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#00FF88] font-mono text-xs focus:outline-none focus:border-[#00FF88] disabled:opacity-40"
+              />
+              <span className="text-[#71717a] text-[10px]">/</span>
+              <input
+                type="number"
+                value={settings?.trailingStopPercent ?? 12}
+                onChange={(e) => handleUpdateSettings({ trailingStopPercent: parseFloat(e.target.value) || 1 })}
+                step={1}
+                min={1}
+                disabled={!settings?.trailingStopEnabled}
+                title="Exit if price pulls back this % from peak"
+                className="w-full px-2 py-1 rounded bg-[#09090b] border border-[#27272a] text-[#ff4444] font-mono text-xs focus:outline-none focus:border-[#ff4444] disabled:opacity-40"
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -623,9 +811,7 @@ export const PaperTradingPanel: React.FC = () => {
                           </div>
                         </td>
                         <td className="py-2 px-2 text-right text-[#e4e4e7]">
-                          {p.quantity >= 1000
-                            ? p.quantity.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                            : p.quantity.toFixed(4)}
+                          {formatTokenQuantity(p.quantity)}
                         </td>
                         <td className="py-2 px-2 text-right">
                           <div className="text-[#71717a]">
@@ -642,6 +828,11 @@ export const PaperTradingPanel: React.FC = () => {
                           <div className="text-[#ff4444]">
                             SL ({p.stopLossPercent || 15}%): {p.stopLossPriceSol ? (p.stopLossPriceSol < 0.0001 ? p.stopLossPriceSol.toExponential(2) : p.stopLossPriceSol.toFixed(6)) : '—'}
                           </div>
+                          {p.trailingStopEnabled && p.trailingActive && (
+                            <div className="text-[#facc15]" title="Fixed TP superseded — exits on pullback from peak">
+                              TRAIL ({p.trailingStopPercent}%): {p.trailingStopPriceSol ? (p.trailingStopPriceSol < 0.0001 ? p.trailingStopPriceSol.toExponential(2) : p.trailingStopPriceSol.toFixed(6)) : '—'}
+                            </div>
+                          )}
                         </td>
                         <td className="py-2 px-2 text-right font-bold">
                           <span className={uPnl >= 0 ? 'text-[#00FF88]' : 'text-[#ff4444]'}>
@@ -743,9 +934,7 @@ export const PaperTradingPanel: React.FC = () => {
                         
                         {/* Quantity Sold - NEW COLUMN */}
                         <td className="py-1.5 px-1.5 text-right text-[#e4e4e7]">
-                          {t.tokenAmount >= 1000
-                            ? t.tokenAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                            : t.tokenAmount.toFixed(4)}
+                          {formatTokenQuantity(t.tokenAmount)}
                         </td>
                         
                         {/* Fill Price */}
@@ -841,9 +1030,7 @@ export const PaperTradingPanel: React.FC = () => {
                           : p.currentPriceSol.toFixed(6)}
                       </td>
                       <td className="py-2 px-2 text-right text-[#e4e4e7]">
-                        {p.quantity >= 1000
-                          ? p.quantity.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                          : p.quantity.toFixed(4)}
+                        {formatTokenQuantity(p.quantity)}
                       </td>
                       <td className="py-2 px-2 text-right text-[#71717a]">
                         {p.costBasisSol.toFixed(3)}

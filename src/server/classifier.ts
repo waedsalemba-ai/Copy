@@ -7,7 +7,6 @@ import { RawSolanaTransaction } from './dexAdapters/DexAdapter';
 import { dexRegistry } from './dexAdapters/DexRegistry';
 import { rpcService } from './rpcService';
 import { db } from './db';
-import { config } from './config';
 import { riskAnalysisService } from './riskAnalysisService';
 
 export class TradeClassifier {
@@ -71,15 +70,24 @@ export class TradeClassifier {
       // Analyze raw balance deltas
       const solDelta = postSol - preSol;
       const hasTokenChange = Boolean(tx.preTokenBalance || tx.postTokenBalance);
+      const tokenChangeAmt = Math.abs(
+        (tx.postTokenBalance?.amount || 0) - (tx.preTokenBalance?.amount || 0)
+      );
 
-      if (hasTokenChange && Math.abs(solDelta) < 0.0001) {
+      if (hasTokenChange && tokenChangeAmt > 0 && Math.abs(solDelta) > 0.0005) {
+        // Token and SOL changed in opposite directions => SWAP
+        const isBuy = solDelta < 0; // Spent SOL to acquire token
+        action = isBuy ? 'BUY' : 'SELL';
+        confidence = 0.75;
+        tokenMint = tx.postTokenBalance?.mint || tx.preTokenBalance?.mint || 'UNKNOWN';
+        tokenAmount = tokenChangeAmt;
+        solAmount = Math.abs(solDelta);
+      } else if (hasTokenChange && Math.abs(solDelta) < 0.0005) {
         // SPL Token transfer without SOL trade => TRANSFER
         action = 'TRANSFER';
         confidence = 0.9;
         tokenMint = tx.postTokenBalance?.mint || tx.preTokenBalance?.mint || 'UNKNOWN';
-        tokenAmount = Math.abs(
-          (tx.postTokenBalance?.amount || 0) - (tx.preTokenBalance?.amount || 0)
-        );
+        tokenAmount = tokenChangeAmt;
       } else if (!hasTokenChange && Math.abs(solDelta) > 0.001) {
         // Plain SOL transfer => TRANSFER
         action = 'TRANSFER';
@@ -119,8 +127,12 @@ export class TradeClassifier {
       executionPriceSol = solAmount / tokenAmount;
     }
 
-    const usdValue = solAmount * config.solPriceUsd;
-    const executionPriceUsd = executionPriceSol * config.solPriceUsd;
+    // Live SOL/USD rate (kept fresh in the background by rpcService),
+    // rather than the fixed benchmark constant in config, which would
+    // otherwise drift from the real market price over time.
+    const solPriceUsd = rpcService.getSolPriceUsd();
+    const usdValue = solAmount * solPriceUsd;
+    const executionPriceUsd = executionPriceSol * solPriceUsd;
 
     // Detection latency: actual wall-clock time between the transaction's
     // on-chain blockTime and when we finished classifying it. This used to

@@ -84,6 +84,7 @@ export interface TokenRiskAnalysis {
   liquidityUsd?: number;
   topHolderPercent?: number;
   top10HolderPercent?: number;
+  topHoldersConcentrationPct?: number;
   ageMinutes?: number;
   // 24h volume vs market cap: a token trading many multiples of its own
   // market cap in a day is a classic wash-trading / pump signal.
@@ -205,20 +206,34 @@ export interface SystemMetrics {
   wsClientCount: number;
   reconnectCount: number;
   activeWalletsCount: number;
+
+  // Independent Pipeline States
+  liveStreamRunning?: boolean;
+  paperTradingRunning?: boolean;
 }
 
 export interface AppSettings {
+  // Live Stream Configuration
+  liveApiKey?: string;
+  primaryRpcUrl?: string;
+  secondaryRpcUrl?: string;
+  primaryLaserstreamEndpoint?: string;
+  primaryLaserstreamApiKey?: string;
+  secondaryLaserstreamEndpoint?: string;
+  secondaryLaserstreamApiKey?: string;
+  solanaWssUrl?: string;
+
+  // Paper Trading Configuration (strictly isolated)
+  paperApiKey?: string;
+  jupiterApiKey?: string;
+
+  // Backward compatibility aliases
   rpcUrl: string;
   laserstreamApiKey: string;
   laserstreamEndpoint: string;
+
   minTradeAlertValueUsd: number;
   webhookUrl?: string;
-  // Optional Jupiter Developer Platform API key (format: starts with "jup").
-  // Without one, Jupiter price/quote calls run keyless at a very low rate
-  // limit and can fail outright now that lite-api.jup.ag is being retired —
-  // this is why unrealized PnL and paper-trade fills silently degrade to the
-  // DexScreener fallback without a key configured.
-  jupiterApiKey?: string;
 }
 
 export interface AcceptanceTestStepResult {
@@ -242,6 +257,25 @@ export interface CopyTradeSettings {
   startingVirtualSolBalance: number;
   takeProfitPercent: number;
   stopLossPercent: number;
+
+  // Confidence-weighted position sizing. When enabled, each mirrored buy's
+  // size is `fixedSolAmountPerTrade * multiplier`, where `multiplier` is
+  // derived from the source wallet's track record, the token's risk score,
+  // and (when available) the buy-entry momentum score — blended into a 0..1
+  // confidence and mapped onto [minSizeMultiplier, maxSizeMultiplier].
+  confidenceSizingEnabled: boolean;
+  minSizeMultiplier: number;
+  maxSizeMultiplier: number;
+
+  // Trailing stop-loss. Once a position's gain from entry reaches
+  // trailingActivationPercent, the fixed take-profit is superseded: the
+  // position is instead exited when price falls trailingStopPercent off its
+  // peak since entry, letting winners run past the original TP target.
+  // Positions that never reach the activation threshold keep the original
+  // fixed TP/SL behavior untouched.
+  trailingStopEnabled: boolean;
+  trailingActivationPercent: number;
+  trailingStopPercent: number;
 }
 
 export interface PaperPosition {
@@ -276,7 +310,22 @@ export interface PaperPosition {
   takeProfitPriceSol: number;
   stopLossPercent: number;
   stopLossPriceSol: number;
-  exitReason?: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL';
+  exitReason?: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'MANUAL';
+
+  // Confidence-weighted sizing inputs, recorded at entry for transparency
+  // (shown in the UI so a user can see *why* a position was sized the way
+  // it was) — purely informational, never re-derived after entry.
+  sizeMultiplier?: number;
+  confidenceScore?: number;
+
+  // Trailing stop-loss state. Copied from settings at entry so a later
+  // settings change doesn't retroactively alter an already-open position.
+  trailingStopEnabled: boolean;
+  trailingActivationPercent: number;
+  trailingStopPercent: number;
+  trailingActive: boolean;
+  highWaterMarkPriceSol: number;
+  trailingStopPriceSol?: number;
 
   status: 'OPEN' | 'EXIT_PENDING' | 'PAPER_SELLING' | 'CLOSED';
 }
@@ -302,7 +351,7 @@ export interface PaperTrade {
   mirrorRatio: number;
   timestamp: number;
   status: 'FILLED' | 'CANCELLED' | 'REJECTED';
-  reason: 'PAPER_BUY' | 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL';
+  reason: 'PAPER_BUY' | 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'MANUAL' | 'OBSERVE_SELL';
 }
 
 export interface PaperAccount {
@@ -330,6 +379,15 @@ export interface BuyEntrySettings {
   watchWindowMinutes: number;
 }
 
+export interface GateResult {
+  gateNumber: number;
+  name: string;
+  passed: boolean;
+  score?: number;
+  maxScore?: number;
+  details: string;
+}
+
 export interface BuyEntryVerdict {
   tokenMint: string;
   tokenSymbol: string;
@@ -338,5 +396,8 @@ export interface BuyEntryVerdict {
   reasons: string[];
   dataGaps: string[];
   evaluatedAt: number;
+  gates?: GateResult[];
+  hardRejection?: { triggered: boolean; reason?: string };
+  antiChase?: { triggered: boolean; m5ChangePct: number; thresholdPct: number };
 }
 

@@ -1,6 +1,0 @@
-{
-  "name": "Solana Trader Wallet Monitor",
-  "description": "Real-time Solana smart-money trader wallet monitoring and trade detection system with low-latency LaserStream ingestion, canonical trade classification, position engine, and trading terminal dashboard.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

@@ -8,10 +8,17 @@ import {
   collection,
   onSnapshot,
   disableNetwork,
+  terminate,
+  setLogLevel,
   Firestore,
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
 import { TraderWallet, AppSettings, CopyTradeSettings, PaperAccount, PaperTrade, PaperPosition } from './types';
+
+// Silence internal Firestore log messages completely
+try {
+  setLogLevel('silent');
+} catch {}
 
 export const firebaseConfig = {
   projectId: 'powerful-utility-tsx2c',
@@ -39,14 +46,14 @@ let connectionVerified = false;
 let isQuotaExceededClient = false;
 let quotaListeners: Array<(exceeded: boolean) => void> = [];
 
-// Proactively disable network at startup if quota was previously exceeded
+// Proactively disable network/terminate streams at startup if quota was previously exceeded
 try {
   const savedQuotaTs = typeof window !== 'undefined' ? localStorage.getItem(QUOTA_STORAGE_KEY) : null;
   if (savedQuotaTs) {
     const elapsedMs = Date.now() - Number(savedQuotaTs);
     if (elapsedMs < 18 * 60 * 60 * 1000) {
       isQuotaExceededClient = true;
-      disableNetwork(firestore).catch(() => {});
+      terminate(firestore).catch(() => disableNetwork(firestore)).catch(() => {});
       console.warn('[Firebase Client] Persistent quota limit active. Firestore network stream disabled; using local storage.');
     } else {
       localStorage.removeItem(QUOTA_STORAGE_KEY);
@@ -64,7 +71,7 @@ export const setClientQuotaExceeded = (exceeded: boolean) => {
         localStorage.setItem(QUOTA_STORAGE_KEY, String(Date.now()));
       }
     } catch {}
-    disableNetwork(firestore).catch(() => {});
+    terminate(firestore).catch(() => disableNetwork(firestore)).catch(() => {});
     quotaListeners.forEach((cb) => cb(true));
   }
 };
@@ -97,7 +104,7 @@ function markQuotaExceeded(err: unknown): boolean {
       console.warn(
         '[Firebase Client] Firestore daily write quota limit reached (20,000 writes/day). Disabling Firestore network stream. Operating in Local Storage mode.'
       );
-      disableNetwork(firestore).catch(() => {});
+      terminate(firestore).catch(() => disableNetwork(firestore)).catch(() => {});
       quotaListeners.forEach((cb) => cb(true));
     }
     return true;
@@ -107,6 +114,7 @@ function markQuotaExceeded(err: unknown): boolean {
 
 // Initialize Anonymous Authentication for User Identity
 export const initFirebaseAuth = async (): Promise<User | null> => {
+  if (isQuotaExceededClient) return null;
   return new Promise((resolve) => {
     onAuthStateChanged(auth, async (user) => {
       if (user) {

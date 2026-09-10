@@ -2,10 +2,15 @@ import { PublicKey } from '@solana/web3.js';
 import { TokenRiskAnalysis, TokenRiskLevel } from '../types';
 import { rpcService } from './rpcService';
 import { eventBus, SystemEvents } from './eventBus';
+import { dexScreenerService } from './dexScreenerService';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const CACHE_TTL_MS = 5 * 60 * 1000; // re-check every 5 minutes
 const FETCH_TIMEOUT_MS = 3500;
+// Every mint ever analyzed used to get a permanent cache entry — a slow
+// memory leak on a long-running process. Oldest entries (Map insertion
+// order) are evicted once this cap is hit.
+const CACHE_MAX_ENTRIES = 3000;
 
 /**
  * Best-effort, free-data-only rug/scam risk read for an SPL token mint.
@@ -38,7 +43,7 @@ class RiskAnalysisService {
       this.inFlight.add(tokenMint);
       this.analyze(tokenMint)
         .then((result) => {
-          this.cache.set(tokenMint, result);
+          this.setCache(tokenMint, result);
           eventBus.emit(SystemEvents.TOKEN_RISK_UPDATED, result);
         })
         .catch((err) => {
@@ -51,7 +56,7 @@ class RiskAnalysisService {
             analyzedAt: Date.now(),
             error: err?.message || 'Unknown error',
           };
-          this.cache.set(tokenMint, fallback);
+          this.setCache(tokenMint, fallback);
           eventBus.emit(SystemEvents.TOKEN_RISK_UPDATED, fallback);
         })
         .finally(() => this.inFlight.delete(tokenMint));
@@ -69,8 +74,20 @@ class RiskAnalysisService {
       pending: true,
       analyzedAt: Date.now(),
     };
-    this.cache.set(tokenMint, pending);
+    this.setCache(tokenMint, pending);
     return pending;
+  }
+
+  private setCache(tokenMint: string, value: TokenRiskAnalysis): void {
+    // Re-inserting an existing key moves it to the end of Map iteration
+    // order, so eviction below correctly drops the least-recently-updated
+    // mint rather than an arbitrary one.
+    this.cache.delete(tokenMint);
+    this.cache.set(tokenMint, value);
+    if (this.cache.size > CACHE_MAX_ENTRIES) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) this.cache.delete(oldestKey);
+    }
   }
 
   private async withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -88,44 +105,13 @@ class RiskAnalysisService {
     volume24hUsd?: number;
     marketCapUsd?: number;
   }> {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`, {
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) return {};
-
-      const data = await res.json();
-      const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-      if (pairs.length === 0) return {};
-
-      // Prefer the deepest pool if the token trades on several.
-      const best = pairs.reduce((a: any, b: any) =>
-        (b?.liquidity?.usd || 0) > (a?.liquidity?.usd || 0) ? b : a
-      );
-
-      const liquidityUsd =
-        typeof best?.liquidity?.usd === 'number' ? best.liquidity.usd : undefined;
-      const ageMinutes = best?.pairCreatedAt
-        ? Math.max(0, (Date.now() - best.pairCreatedAt) / 60000)
-        : undefined;
-      const volume24hUsd = typeof best?.volume?.h24 === 'number' ? best.volume.h24 : undefined;
-      // marketCap is DexScreener's circulating-supply figure; fdv (fully
-      // diluted valuation) is the closest fallback when marketCap is absent
-      // (common for tokens with unknown/unverified circulating supply).
-      const marketCapUsd =
-        typeof best?.marketCap === 'number'
-          ? best.marketCap
-          : typeof best?.fdv === 'number'
-          ? best.fdv
-          : undefined;
-
-      return { liquidityUsd, ageMinutes, volume24hUsd, marketCapUsd };
-    } catch {
-      return {};
-    }
+    const data = await dexScreenerService.getTokenData(tokenMint);
+    return {
+      liquidityUsd: data.liquidityUsd,
+      ageMinutes: data.ageMinutes,
+      volume24hUsd: data.volume24hUsd,
+      marketCapUsd: data.marketCapUsd,
+    };
   }
 
   private async fetchAuthorityFlags(

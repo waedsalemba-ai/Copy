@@ -1,7 +1,8 @@
-import { IDexAdapter, RawSolanaTransaction, DecodedSwapResult } from './DexAdapter';
+import { RawSolanaTransaction, DecodedSwapResult } from './DexAdapter';
+import { BaseDexAdapter } from './BaseDexAdapter';
 import { DexProtocol } from '../../types';
 
-export class RaydiumAdapter implements IDexAdapter {
+export class RaydiumAdapter extends BaseDexAdapter {
   dexName: DexProtocol = 'Raydium';
   programIds: string[] = [
     '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM V4
@@ -10,8 +11,8 @@ export class RaydiumAdapter implements IDexAdapter {
     'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium Standard AMM / CP-Swap
   ];
 
-  identifyTransaction(tx: RawSolanaTransaction): boolean {
-    return tx.instructions.some((ix) => this.programIds.includes(ix.programId)) ||
+  override identifyTransaction(tx: RawSolanaTransaction): boolean {
+    return super.identifyTransaction(tx) ||
       Boolean(tx.logMessages?.some((log) => log.includes('Raydium') || log.includes('675kPX9')));
   }
 
@@ -34,43 +35,8 @@ export class RaydiumAdapter implements IDexAdapter {
     };
   }
 
-  calculateInput(tx: RawSolanaTransaction): { mint: string; amount: number } | null {
-    const solDelta = tx.preSolBalance - tx.postSolBalance;
-    if (solDelta > 0.001) {
-      return { mint: 'So11111111111111111111111111111111111111112', amount: solDelta };
-    }
-    if (tx.preTokenBalance && tx.postTokenBalance && tx.preTokenBalance.amount > tx.postTokenBalance.amount) {
-      return {
-        mint: tx.preTokenBalance.mint,
-        amount: tx.preTokenBalance.amount - tx.postTokenBalance.amount,
-      };
-    }
-    return null;
-  }
-
-  calculateOutput(tx: RawSolanaTransaction): { mint: string; amount: number } | null {
-    const solDelta = tx.postSolBalance - tx.preSolBalance;
-    if (solDelta > 0.001) {
-      return { mint: 'So11111111111111111111111111111111111111112', amount: solDelta };
-    }
-    if (tx.preTokenBalance && tx.postTokenBalance && tx.postTokenBalance.amount > tx.preTokenBalance.amount) {
-      return {
-        mint: tx.postTokenBalance.mint,
-        amount: tx.postTokenBalance.amount - tx.preTokenBalance.amount,
-      };
-    }
-    return null;
-  }
-
-  identifyToken(tx: RawSolanaTransaction): string | null {
-    return tx.preTokenBalance?.mint || tx.postTokenBalance?.mint || null;
-  }
-
-  identifyExecutionPrice(inputAmount: number, outputAmount: number): number {
-    return inputAmount > 0 ? outputAmount / inputAmount : 0;
-  }
-
-  identifyPool(tx: RawSolanaTransaction): string | null {
+  override identifyPool(_tx: RawSolanaTransaction): string {
     return 'Raydium-AMM-Pool';
   }
 }
+

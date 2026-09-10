@@ -1,0 +1,67 @@
+--- a/src/server/paperTradingService.ts
++++ b/src/server/paperTradingService.ts
+@@ -80,6 +80,55 @@ export class PaperTradingService {
+    * Continuous Monitoring and TP/SL Execution Engine
+    * Fetches fresh read-only Jupiter price quotes and evaluates TP/SL thresholds for all OPEN paper positions.
+    */
++  /**
++   * Safely execute TPSL exit with proper state management and rollback on failure
++   */
++  private async handleTPSLExitSafely(position: PaperPosition): Promise<void> {
++    const originalStatus = position.status;
++    
++    // Don't exit if already closing/closed
++    if (originalStatus !== 'OPEN') {
++      return;
++    }
++
++    try {
++      // Mark position as pending to prevent concurrent exits
++      position.status = 'EXIT_PENDING';
++      db.savePaperPosition(position);
++
++      // Execute the actual exit
++      const result = await this.executePaperSellExit(position);
++      
++      // If exit didn't complete to CLOSED, something went wrong
++      if (!result || position.status !== 'CLOSED') {
++        throw new Error('Position did not reach CLOSED state after exit');
++      }
++    } catch (err) {
++      console.error(`[PaperTrading] TPSL exit failed for position ${position.id}:`, err);
++      
++      // Restore original state on failure
++      position.status = originalStatus;
++      db.savePaperPosition(position);
++      
++      // Emit alert to user UI
++      const exitReason = position.stopLossPriceSol >= position.currentPriceSol 
++        ? 'Stop Loss'
++        : 'Take Profit';
++      
++      eventBus.emit(SystemEvents.SYSTEM_ALERT, {
++        id: `alert_${Date.now()}`,
++        type: 'LARGE_TRADE',
++        title: `Paper Position ${exitReason} Failed`,
++        message: `Position ${position.tokenSymbol} exit encountered an error and was reverted to OPEN state`,
++        traderName: position.traderName,
++        timestamp: Date.now(),
++        read: false,
++      });
++    }
++  }
++
+   public async refreshOpenPositionPrices(): Promise<void> {
+     const openPositions = db.getPaperPositions().filter((p) => p.status === 'OPEN');
+     if (openPositions.length === 0) {
+@@ -117,10 +166,7 @@ export class PaperTradingService {
+             : position.stopLossPriceSol >= position.currentPriceSol
+         ) {
+           // TP/SL triggered: fire background exit so one slow exit doesn't delay refreshing others
+-          this.executePaperSellExit(position).catch((err) => {
+-            console.error('[PaperTrading] TPSL exit failed:', err);
+-          });
++          this.handleTPSLExitSafely(position); // Fire and forget, but safe
+         }
+       }
+     }

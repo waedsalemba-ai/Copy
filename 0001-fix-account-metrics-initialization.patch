@@ -1,0 +1,26 @@
+--- a/src/server/paperTradingService.ts
++++ b/src/server/paperTradingService.ts
+@@ -52,14 +52,21 @@ export class PaperTradingService {
+   }
+ 
+   private recomputeAccountMetrics(): void {
+     const account = db.getPaperAccount();
++    if (!account) {
++      console.error('[PaperTrading] Account not initialized in database');
++      return;
++    }
++
+     const openPositions = db.getPaperPositions().filter((p) => p.status === 'OPEN');
+     
+     const investedValueSol = openPositions.reduce((sum, p) => sum + p.costBasisSol, 0);
+     const totalUnrealizedPnlSol = openPositions.reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
+-    const totalPaperEquitySol = account.virtualSolBalance + investedValueSol + totalUnrealizedPnlSol;
++    
++    // Safely handle null values with defaults
++    const virtualBalance = account.virtualSolBalance ?? 0;
++    const totalPaperEquitySol = virtualBalance + investedValueSol + totalUnrealizedPnlSol;
+ 
+     db.updatePaperAccount({
+       investedValueSol,
+       totalUnrealizedPnlSol,
+       totalPaperEquitySol,

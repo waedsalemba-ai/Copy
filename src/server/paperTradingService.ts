@@ -2,15 +2,26 @@ import { eventBus, SystemEvents } from './eventBus';
 import { db } from './db';
 import { rpcService } from './rpcService';
 import { buyEntryEngine } from './buyEntryEngine';
-import { CanonicalTradeEvent, PaperPosition, PaperTrade } from '../types';
+import { CanonicalTradeEvent, CopyTradeSettings, PaperPosition, PaperTrade, BuyEntryVerdict } from '../types';
 import { assertPaperExecution } from './paperExecutionGuard';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const PRICE_REFRESH_INTERVAL_MS = 15000;
 
+const PROCESSED_SIGNATURES_MAX = 10000;
+const PROCESSED_SIGNATURES_TRIM = 2000;
+
 export class PaperTradingService {
   private refreshTimer: NodeJS.Timeout | null = null;
   private processedSourceSignatures = new Set<string>();
+  // Wallet+token keys with a buy currently in flight (past the dedup/balance
+  // checks but not yet resolved). Closes a TOCTOU race: without this, two
+  // BUY events for the same wallet+token arriving close together could both
+  // pass the "no existing open position" / "enough balance" checks against
+  // stale state (those checks happen before the `await` on the price quote)
+  // and both go on to open a position and debit the virtual balance.
+  private pendingBuyKeys = new Set<string>();
+  private pendingSellKeys = new Set<string>();
 
   constructor() {
     eventBus.on(SystemEvents.TRADE_DETECTED, (trade: CanonicalTradeEvent) => {
@@ -21,9 +32,9 @@ export class PaperTradingService {
       }
     });
 
-    eventBus.on(SystemEvents.BUY_ENTRY_RESOLVED, (payload: { trade: CanonicalTradeEvent; verdict: any }) => {
+    eventBus.on(SystemEvents.BUY_ENTRY_RESOLVED, (payload: { trade: CanonicalTradeEvent; verdict: BuyEntryVerdict }) => {
       if (payload.verdict?.verdict === 'BUY') {
-        this.executeMirroredBuy(payload.trade);
+        this.executeMirroredBuy(payload.trade, payload.verdict);
       }
     });
 
@@ -41,13 +52,30 @@ export class PaperTradingService {
     }
   }
 
-  private recomputeAccountMetrics(): void {
+  private lastMetricsComputeTime = 0;
+  private metricsComputeThrottleMs = 3000; // Recalculate at most every 3s during continuous refreshes
+
+  private recomputeAccountMetrics(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastMetricsComputeTime < this.metricsComputeThrottleMs) {
+      return;
+    }
+    this.lastMetricsComputeTime = now;
+
     const account = db.getPaperAccount();
+    if (!account) {
+      console.error('[PaperTrading] Account not initialized in database');
+      return;
+    }
+
     const openPositions = db.getPaperPositions().filter((p) => p.status === 'OPEN');
     
     const investedValueSol = openPositions.reduce((sum, p) => sum + p.costBasisSol, 0);
     const totalUnrealizedPnlSol = openPositions.reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
-    const totalPaperEquitySol = account.virtualSolBalance + investedValueSol + totalUnrealizedPnlSol;
+    
+    // Safely handle null values with defaults
+    const virtualBalance = account.virtualSolBalance ?? 0;
+    const totalPaperEquitySol = virtualBalance + investedValueSol + totalUnrealizedPnlSol;
 
     db.updatePaperAccount({
       investedValueSol,
@@ -89,17 +117,11 @@ export class PaperTradingService {
           position.currentPriceSol = freshPrice;
           this.recomputeUnrealized(position);
 
-          // Evaluate Take-Profit and Stop-Loss thresholds
-          const hitTP = position.takeProfitPriceSol > 0 && freshPrice >= position.takeProfitPriceSol;
-          const hitSL = position.stopLossPriceSol > 0 && freshPrice <= position.stopLossPriceSol;
+          // Evaluate Take-Profit / Stop-Loss / Trailing-Stop thresholds
+          const exitReason = this.evaluateExit(position, freshPrice);
 
-          if (hitTP || hitSL) {
-            // Idempotent state transition: OPEN -> EXIT_PENDING -> PAPER_SELLING -> CLOSED
-            position.status = 'EXIT_PENDING';
-            db.savePaperPosition(position);
-
-            const exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' = hitTP ? 'TAKE_PROFIT' : 'STOP_LOSS';
-            await this.executePaperSellExit(position, freshPrice, exitReason);
+          if (exitReason) {
+            this.handleTPSLExitSafely(position, freshPrice, exitReason); // Fire and forget, but safe
           } else {
             db.savePaperPosition(position);
             eventBus.emit(SystemEvents.PAPER_POSITION_UPDATED, position);
@@ -109,6 +131,105 @@ export class PaperTradingService {
       this.recomputeAccountMetrics();
     } catch (err) {
       console.error('[PaperTrading] Price refresh batch failed:', err);
+    }
+  }
+
+  /**
+   * Updates trailing-stop bookkeeping for a position (high-water mark,
+   * activation) and decides whether an exit condition has been hit.
+   * Mutates the position's trailing fields as a side effect so the peak
+   * price keeps climbing even on refreshes that don't trigger an exit.
+   *
+   * Once a trailing-enabled position activates (price has risen
+   * `trailingActivationPercent` above entry), the fixed take-profit is
+   * superseded — the position is instead exited only when price pulls back
+   * `trailingStopPercent` from its peak, letting winners run past the
+   * original TP target. The static stop-loss still applies underneath as a
+   * floor. Positions that never activate keep the original fixed TP/SL
+   * behavior untouched.
+   */
+  private evaluateExit(
+    position: PaperPosition,
+    freshPrice: number
+  ): 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | null {
+    if (position.trailingStopEnabled) {
+      if (freshPrice > position.highWaterMarkPriceSol) {
+        position.highWaterMarkPriceSol = freshPrice;
+      }
+
+      if (!position.trailingActive) {
+        const activationPriceSol = position.avgEntryPriceSol * (1 + position.trailingActivationPercent / 100);
+        if (freshPrice >= activationPriceSol) {
+          position.trailingActive = true;
+        }
+      }
+
+      if (position.trailingActive) {
+        position.trailingStopPriceSol = position.highWaterMarkPriceSol * (1 - position.trailingStopPercent / 100);
+        const effectiveStop = Math.max(position.trailingStopPriceSol, position.stopLossPriceSol);
+        return freshPrice <= effectiveStop ? 'TRAILING_STOP' : null;
+      }
+    }
+
+    // Trailing not enabled, or enabled but not yet activated.
+    if (position.stopLossPriceSol > 0 && freshPrice <= position.stopLossPriceSol) {
+      return 'STOP_LOSS';
+    }
+    if (position.takeProfitPriceSol > 0 && freshPrice >= position.takeProfitPriceSol) {
+      return 'TAKE_PROFIT';
+    }
+    return null;
+  }
+
+  /**
+   * Safely execute TPSL exit with proper state management and rollback on failure
+   */
+  private async handleTPSLExitSafely(
+    position: PaperPosition,
+    freshPrice: number | undefined,
+    exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP'
+  ): Promise<void> {
+    const originalStatus = position.status;
+    
+    // Don't exit if already closing/closed
+    if (originalStatus !== 'OPEN') {
+      return;
+    }
+
+    const price = freshPrice || position.currentPriceSol;
+
+    try {
+      // Mark position as pending to prevent concurrent exits
+      position.status = 'EXIT_PENDING';
+      db.savePaperPosition(position);
+
+      // Execute the actual exit
+      await this.executePaperSellExit(position, price, exitReason);
+      
+      // If exit didn't complete to CLOSED, something went wrong
+      if ((position.status as string) !== 'CLOSED') {
+        throw new Error('Position did not reach CLOSED state after exit');
+      }
+    } catch (err) {
+      console.error(`[PaperTrading] TPSL exit failed for position ${position.id}:`, err);
+      
+      // Restore original state on failure
+      position.status = originalStatus;
+      db.savePaperPosition(position);
+      
+      // Emit alert to user UI
+      const displayReason =
+        exitReason === 'STOP_LOSS' ? 'Stop Loss' : exitReason === 'TRAILING_STOP' ? 'Trailing Stop' : 'Take Profit';
+      
+      eventBus.emit(SystemEvents.SYSTEM_ALERT, {
+        id: `alert_${Date.now()}`,
+        type: 'LARGE_TRADE',
+        title: `Paper Position ${displayReason} Failed`,
+        message: `Position ${position.tokenSymbol} exit encountered an error and was reverted to ${originalStatus} state`,
+        traderName: position.traderName,
+        timestamp: Date.now(),
+        read: false,
+      });
     }
   }
 
@@ -198,9 +319,16 @@ export class PaperTradingService {
       console.error('[PaperTrading] Live sell quote failed, using spot-price fallback:', err);
     }
 
+    // Estimate price impact based on exit size and liquidity conditions
+    // Larger exits have more impact due to liquidity constraints
+    const liquidityImpactFactor = Math.min(
+      5, // Cap at 5% max estimated impact
+      Math.max(0.01, (params.quantity * params.spotPriceSol) / 10000) // Scales with position size
+    );
+
     return {
       fillPriceSol: params.spotPriceSol * (1 - params.baseSlippageBps / 10000),
-      priceImpactPercent: 0.01,
+      priceImpactPercent: liquidityImpactFactor,
     };
   }
 
@@ -220,7 +348,9 @@ export class PaperTradingService {
   }
 
   private handleBuy(trade: CanonicalTradeEvent): void {
-    // Check if copy trading or buy entry is enabled
+    const copyTradeSettings = db.getCopyTradeSettings();
+    if (!copyTradeSettings.enabled) return;
+
     const buyEntrySettings = db.getBuyEntrySettings();
     if (!buyEntrySettings.enabled) {
       this.executeMirroredBuy(trade);
@@ -237,7 +367,56 @@ export class PaperTradingService {
    * STRICT SAFETY RULE: Must pass `assertPaperExecution()`.
    * Requires a valid fresh Jupiter price quote. If quote unavailable/invalid, BUY is blocked.
    */
-  public async executeMirroredBuy(trade: CanonicalTradeEvent): Promise<boolean> {
+  /**
+   * Confidence-weighted sizing. Blends three independent 0..1 signals —
+   * each defaulting to neutral (0.5) when the underlying data isn't
+   * available — into a single confidence score, then maps that onto a size
+   * multiplier within the configured [minSizeMultiplier, maxSizeMultiplier]
+   * bounds. This only scales the user's configured base size up or down; it
+   * never picks a size independent of `fixedSolAmountPerTrade`.
+   */
+  private computeSizeConfidence(
+    trade: CanonicalTradeEvent,
+    verdict: BuyEntryVerdict | undefined,
+    settings: CopyTradeSettings
+  ): { confidence: number; multiplier: number } {
+    // 1. Source wallet's track record, shrunk toward neutral for small
+    // sample sizes so a wallet with 2 trades doesn't swing sizing as hard
+    // as one with 200.
+    const wallet = db.getWalletByAddress(trade.walletAddress);
+    let walletConfidence = 0.5;
+    if (wallet) {
+      const sampleSize = wallet.metrics.totalBuys + wallet.metrics.totalSells;
+      const shrinkage = Math.min(1, sampleSize / 20);
+      const rawWinRate = Math.max(0, Math.min(100, wallet.metrics.winRatePercent)) / 100;
+      walletConfidence = 0.5 + (rawWinRate - 0.5) * shrinkage;
+    }
+
+    // 2. Token rug/risk score (0 safest - 100 most dangerous), inverted.
+    // Neutral if the background risk check hasn't resolved yet.
+    const risk = trade.riskAnalysis;
+    const riskConfidence =
+      risk && !risk.pending && typeof risk.score === 'number'
+        ? 1 - Math.max(0, Math.min(100, risk.score)) / 100
+        : 0.5;
+
+    // 3. Buy-entry momentum score — only present when the buy-entry gate
+    // actually evaluated this trade (BuyEntrySettings.enabled).
+    const momentumConfidence =
+      verdict && typeof verdict.momentumScore === 'number'
+        ? Math.max(0, Math.min(100, verdict.momentumScore)) / 100
+        : 0.5;
+
+    const confidence = (walletConfidence + riskConfidence + momentumConfidence) / 3;
+
+    const min = settings.minSizeMultiplier ?? 0.4;
+    const max = settings.maxSizeMultiplier ?? 1.75;
+    const multiplier = min + confidence * (max - min);
+
+    return { confidence, multiplier };
+  }
+
+  public async executeMirroredBuy(trade: CanonicalTradeEvent, verdict?: BuyEntryVerdict): Promise<boolean> {
     assertPaperExecution();
 
     const settings = db.getCopyTradeSettings();
@@ -250,48 +429,95 @@ export class PaperTradingService {
       return false;
     }
 
-    // Check for existing OPEN position: prevent multiple OPEN positions for same wallet & token
-    const existingOpenPosition = db.getPaperPosition(trade.walletAddress, trade.tokenMint);
-    if (existingOpenPosition && existingOpenPosition.status === 'OPEN') {
+    // Guard against two overlapping buys for the same wallet+token racing
+    // each other through the checks below (both would otherwise pass a
+    // stale "no open position" / "enough balance" read, since those checks
+    // happen before the async price-quote fetch further down).
+    const lockKey = `${trade.walletAddress}:${trade.tokenMint}`;
+    if (this.pendingBuyKeys.has(lockKey)) {
       return false;
     }
+    this.pendingBuyKeys.add(lockKey);
 
-    const solSpent = settings.fixedSolAmountPerTrade || 0.5;
-    if (account.virtualSolBalance < solSpent) {
-      console.warn('[PaperTrading] Insufficient paper SOL balance for trade');
-      return false;
-    }
-
-    // Obtain fresh Jupiter price quote
-    let quotedPriceSol: number | null = null;
     try {
-      quotedPriceSol = await rpcService.getJupiterPrice(trade.tokenMint);
-      if (!quotedPriceSol) {
-        const meta = await rpcService.getTokenMetadata(trade.tokenMint);
-        quotedPriceSol = meta?.priceSol || null;
+      // Check for existing position in any active state (don't allow concurrent positions)
+      const existingOpenPosition = db.getPaperPosition(trade.walletAddress, trade.tokenMint);
+      if (existingOpenPosition) {
+        // Reject if position is not CLOSED (includes OPEN, EXIT_PENDING, PAPER_SELLING)
+        if (existingOpenPosition.status !== 'CLOSED') {
+          console.warn(
+            `[PaperTrading] Cannot open new position for ${trade.tokenSymbol}: ` +
+            `existing position in ${existingOpenPosition.status} state`
+          );
+          return false;
+        }
       }
-    } catch {
-      quotedPriceSol = null;
-    }
 
-    // Fallback attempt directly if priceMeta null
-    if (!quotedPriceSol || quotedPriceSol <= 0) {
-      if (trade.executionPriceSol && trade.executionPriceSol > 0) {
-        quotedPriceSol = trade.executionPriceSol;
+      const MIN_TRADABLE_SOL = 0.000001; // 1,000 lamports
+      const baseSolSpent = settings.fixedSolAmountPerTrade || 0.5;
+      const sizing = settings.confidenceSizingEnabled
+        ? this.computeSizeConfidence(trade, verdict, settings)
+        : { confidence: 0.5, multiplier: 1 };
+      const solSpent = baseSolSpent * sizing.multiplier;
+      if (account.virtualSolBalance < solSpent || solSpent < MIN_TRADABLE_SOL) {
+        console.warn(`[PaperTrading] Cannot execute BUY: balance (${account.virtualSolBalance}) insufficient or trade amount (${solSpent}) below MIN_TRADABLE_SOL (${MIN_TRADABLE_SOL})`);
+        return false;
       }
-    }
 
-    // If Jupiter price is completely unavailable or invalid, BLOCK the paper BUY
-    if (!quotedPriceSol || quotedPriceSol <= 0) {
-      console.warn(`[PaperTrading] Blocked paper BUY for ${trade.tokenSymbol} (${trade.tokenMint}): invalid or missing Jupiter quote`);
-      return false;
-    }
+      // Mark signature (and lock key) as claimed *before* the first await so
+      // a concurrent call for the same signature/wallet/token can't slip
+      // through while this one is waiting on the network.
+      if (trade.signature) {
+        this.processedSourceSignatures.add(`${trade.walletAddress}_${trade.signature}`);
+        if (this.processedSourceSignatures.size > PROCESSED_SIGNATURES_MAX) {
+          const iterator = this.processedSourceSignatures.values();
+          for (let i = 0; i < PROCESSED_SIGNATURES_TRIM; i++) {
+            const next = iterator.next();
+            if (next.done) break;
+            this.processedSourceSignatures.delete(next.value);
+          }
+        }
+      }
 
-    // Mark signature as processed
-    if (trade.signature) {
-      this.processedSourceSignatures.add(`${trade.walletAddress}_${trade.signature}`);
-    }
+      // Obtain fresh Jupiter price quote
+      let quotedPriceSol: number | null = null;
+      try {
+        quotedPriceSol = await rpcService.getJupiterPrice(trade.tokenMint);
+        if (!quotedPriceSol) {
+          const meta = await rpcService.getTokenMetadata(trade.tokenMint);
+          quotedPriceSol = meta?.priceSol || null;
+        }
+      } catch {
+        quotedPriceSol = null;
+      }
 
+      // Fallback attempt directly if priceMeta null
+      if (!quotedPriceSol || quotedPriceSol <= 0) {
+        if (trade.executionPriceSol && trade.executionPriceSol > 0) {
+          quotedPriceSol = trade.executionPriceSol;
+        }
+      }
+
+      // If Jupiter price is completely unavailable or invalid, BLOCK the paper BUY
+      if (!quotedPriceSol || quotedPriceSol <= 0) {
+        console.warn(`[PaperTrading] Blocked paper BUY for ${trade.tokenSymbol} (${trade.tokenMint}): invalid or missing Jupiter quote`);
+        return false;
+      }
+
+      return await this.finalizeMirroredBuy(trade, settings, solSpent, quotedPriceSol, sizing);
+    } finally {
+      this.pendingBuyKeys.delete(lockKey);
+    }
+  }
+
+  private async finalizeMirroredBuy(
+    trade: CanonicalTradeEvent,
+    settings: CopyTradeSettings,
+    solSpent: number,
+    quotedPriceSol: number,
+    sizing: { confidence: number; multiplier: number }
+  ): Promise<boolean> {
+    const account = db.getPaperAccount();
     const slippageBps = this.effectiveSlippageBps(settings.simulatedSlippageBps || 50, trade.timestamp || Date.now());
     const { fillPriceSol: fillPrice, priceImpactPercent } = await this.resolveBuyFill({
       tokenMint: trade.tokenMint,
@@ -345,6 +571,15 @@ export class PaperTradingService {
       stopLossPercent: slPercent,
       stopLossPriceSol,
 
+      sizeMultiplier: sizing.multiplier,
+      confidenceScore: sizing.confidence,
+
+      trailingStopEnabled: settings.trailingStopEnabled,
+      trailingActivationPercent: settings.trailingActivationPercent ?? 15,
+      trailingStopPercent: settings.trailingStopPercent ?? 12,
+      trailingActive: false,
+      highWaterMarkPriceSol: fillPrice,
+
       status: 'OPEN',
     };
 
@@ -388,33 +623,72 @@ export class PaperTradingService {
   }
 
   /**
-   * MANDATORY SAFETY RULE:
-   * Monitored trader SELL events are strictly observation-only.
-   * Source trader sales NEVER create a paper SELL and NEVER close a paper position.
-   * User paper positions exit exclusively through the server-side TP/SL monitor.
+   * MANDATORY CRITICAL TRADING RULE:
+   * Monitored trader SELL events are strictly informational.
+   * A monitored trader SELL must NEVER automatically close a paper position,
+   * nor change TP, Stop Sell, entry, or modify any paper position fields.
+   * TRADER SELL != PAPER SELL.
+   * Paper positions exit exclusively through TP/SL triggers or Manual Exit.
    */
-  private handleSell(trade: CanonicalTradeEvent): void {
-    // Observation-only: update shadow trader quantity or log event, but NEVER close user paper position or execute paper SELL.
-    const position = db.getPaperPosition(trade.walletAddress, trade.tokenMint);
-    if (position) {
-      position.traderQuantityShadow = Math.max(0, position.traderQuantityShadow - (trade.tokenAmount || 0));
-      if (trade.executionPriceSol && trade.executionPriceSol > 0) {
-        position.currentPriceSol = trade.executionPriceSol;
-        this.recomputeUnrealized(position);
-      }
-      db.savePaperPosition(position);
-      eventBus.emit(SystemEvents.PAPER_POSITION_UPDATED, position);
+  private async handleSell(trade: CanonicalTradeEvent): Promise<void> {
+    console.log(
+      `[PaperTrading] INFORMATIONAL: Monitored trader ${trade.traderName} SOLD ${trade.tokenAmount} $${trade.tokenSymbol}. Paper positions remain untouched.`
+    );
+
+    // Broadcast informational alert to activity feed
+    eventBus.emit(SystemEvents.SYSTEM_ALERT, {
+      id: `alert_trader_sell_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      type: 'SELL',
+      title: `Trader Sold $${trade.tokenSymbol}`,
+      message: `${trade.traderName} sold ${trade.tokenAmount?.toLocaleString() || ''} $${trade.tokenSymbol} (Informational only: Paper position remains OPEN)`,
+      traderName: trade.traderName,
+      walletAddress: trade.walletAddress,
+      signature: trade.signature,
+      timestamp: Date.now(),
+      read: false,
+    });
+  }
+
+  /**
+   * Manual Market Exit requested by user from the terminal interface.
+   * Closes 100% of the paper position at the current market fill price.
+   */
+  public async manualExitPosition(positionId: string): Promise<boolean> {
+    const position = db.getPaperPositions().find((p) => p.id === positionId);
+    if (!position || position.status !== 'OPEN') {
+      return false;
     }
+    await this.executePaperSellExit(position, position.currentPriceSol, 'MANUAL');
+    return true;
+  }
+
+  public isRunning(): boolean {
+    return db.getCopyTradeSettings().enabled;
+  }
+
+  public start(): void {
+    db.updateCopyTradeSettings({ enabled: true });
+    db.updateMetrics({ paperTradingRunning: true });
+    eventBus.emit(SystemEvents.SETTINGS_UPDATED, db.getSettings());
+    console.log('[PaperTrading] Paper Trading Pipeline STARTED');
+  }
+
+  public stop(): void {
+    db.updateCopyTradeSettings({ enabled: false });
+    db.updateMetrics({ paperTradingRunning: false });
+    eventBus.emit(SystemEvents.SETTINGS_UPDATED, db.getSettings());
+    console.log('[PaperTrading] Paper Trading Pipeline STOPPED (Positions preserved)');
   }
 
   /**
    * Executes a Paper SELL transition when Take Profit or Stop Loss is triggered.
    * Idempotent state transition: EXIT_PENDING -> PAPER_SELLING -> CLOSED.
+   * Full position exit (100% of held quantity).
    */
   public async executePaperSellExit(
     position: PaperPosition,
     exitPriceSol: number,
-    exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL'
+    exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'MANUAL'
   ): Promise<void> {
     assertPaperExecution();
 

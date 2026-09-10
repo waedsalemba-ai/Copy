@@ -9,6 +9,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { SystemMetrics, Position } from '../types';
+import { formatSol, formatUsd } from '../utils/formatters';
 
 interface StatCardsProps {
   metrics: SystemMetrics;
@@ -20,6 +21,7 @@ export const StatCards: React.FC<StatCardsProps> = ({ metrics, positions }) => {
 
   const totalRealizedPnl = positions.reduce((acc, p) => acc + p.realizedPnlSol, 0);
   const totalUnrealizedPnl = activePositions.reduce((acc, p) => acc + p.unrealizedPnlSol, 0);
+  const solPriceUsd = 145.5;
 
   const stats = [
     {
@@ -60,8 +62,8 @@ export const StatCards: React.FC<StatCardsProps> = ({ metrics, positions }) => {
     },
     {
       title: 'REALIZED P&L',
-      value: `${totalRealizedPnl >= 0 ? '+' : ''}${totalRealizedPnl.toFixed(2)} SOL`,
-      subText: `~$${(totalRealizedPnl * 145.5).toFixed(0)} USD`,
+      value: formatSol(totalRealizedPnl, 2, true),
+      subText: `~${formatUsd(totalRealizedPnl * solPriceUsd)} USD`,
       icon: DollarSign,
       color: totalRealizedPnl >= 0 ? 'text-[#00FF88]' : 'text-[#ef4444]',
       bgColor: totalRealizedPnl >= 0 ? 'bg-[#00FF88]/10' : 'bg-[#ef4444]/10',
@@ -69,8 +71,8 @@ export const StatCards: React.FC<StatCardsProps> = ({ metrics, positions }) => {
     },
     {
       title: 'UNREALIZED P&L',
-      value: `${totalUnrealizedPnl >= 0 ? '+' : ''}${totalUnrealizedPnl.toFixed(2)} SOL`,
-      subText: `~$${(totalUnrealizedPnl * 145.5).toFixed(0)} USD`,
+      value: formatSol(totalUnrealizedPnl, 2, true),
+      subText: `~${formatUsd(totalUnrealizedPnl * solPriceUsd)} USD`,
       icon: DollarSign,
       color: totalUnrealizedPnl >= 0 ? 'text-[#00FF88]' : 'text-[#ef4444]',
       bgColor: totalUnrealizedPnl >= 0 ? 'bg-[#00FF88]/10' : 'bg-[#ef4444]/10',

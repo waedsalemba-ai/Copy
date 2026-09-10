@@ -1,16 +1,7 @@
 import React, { useState } from 'react';
-import {
-  PieChart,
-  TrendingUp,
-  Clock,
-  ArrowUpRight,
-  ArrowDownRight,
-  ExternalLink,
-  DollarSign,
-  CheckCircle2,
-  XCircle,
-} from 'lucide-react';
+import { PieChart } from 'lucide-react';
 import { Position } from '../types';
+import { formatAddress, formatSol, formatTokenQuantity } from '../utils/formatters';
 
 interface PositionsViewProps {
   positions: Position[];
@@ -115,34 +106,33 @@ export const PositionsView: React.FC<PositionsViewProps> = ({ positions }) => {
                     <td className="py-2 px-2.5">
                       <div className="font-bold text-[#3b82f6]">{p.tokenSymbol}</div>
                       <div className="text-[9px] text-[#71717a]">
-                        {p.tokenMint.slice(0, 4)}...{p.tokenMint.slice(-4)}
+                        {formatAddress(p.tokenMint)}
                       </div>
                     </td>
                     <td className="py-2 px-2.5">
                       <div className="font-bold text-[#fafafa]">{p.traderName}</div>
                       <div className="text-[9px] text-[#71717a]">
-                        {p.walletAddress.slice(0, 4)}...{p.walletAddress.slice(-4)}
+                        {formatAddress(p.walletAddress)}
                       </div>
                     </td>
                     <td className="py-2 px-2.5 text-right font-medium">
-                      {p.currentQuantity.toLocaleString()}
+                      {formatTokenQuantity(p.currentQuantity)}
                     </td>
                     <td className="py-2 px-2.5 text-right text-[#a1a1aa]">
-                      {p.averageEntryPriceSol.toFixed(5)} SOL
+                      {formatSol(p.averageEntryPriceSol, 5)}
                     </td>
                     <td className="py-2 px-2.5 text-right font-bold text-[#fafafa]">
-                      {p.currentPriceSol.toFixed(5)} SOL
+                      {formatSol(p.currentPriceSol, 5)}
                     </td>
                     <td className="py-2 px-2.5 text-right text-[#00FF88]">
-                      {p.remainingCostBasisSol.toFixed(2)} SOL
+                      {formatSol(p.remainingCostBasisSol, 2)}
                     </td>
                     <td
                       className={`py-2 px-2.5 text-right font-bold ${
                         p.realizedPnlSol >= 0 ? 'text-[#00FF88]' : 'text-[#ef4444]'
                       }`}
                     >
-                      {p.realizedPnlSol >= 0 ? '+' : ''}
-                      {p.realizedPnlSol.toFixed(2)} SOL
+                      {formatSol(p.realizedPnlSol, 2, true)}
                     </td>
                     <td
                       className={`py-2 px-2.5 text-right font-bold ${
@@ -150,10 +140,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({ positions }) => {
                       }`}
                     >
                       {p.status === 'OPEN' ? (
-                        <>
-                          {p.unrealizedPnlSol >= 0 ? '+' : ''}
-                          {p.unrealizedPnlSol.toFixed(2)} SOL
-                        </>
+                        formatSol(p.unrealizedPnlSol, 2, true)
                       ) : (
                         <span className="text-[#71717a]">-</span>
                       )}

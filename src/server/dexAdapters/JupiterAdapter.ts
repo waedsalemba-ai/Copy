@@ -1,7 +1,8 @@
-import { IDexAdapter, RawSolanaTransaction, DecodedSwapResult } from './DexAdapter';
+import { RawSolanaTransaction, DecodedSwapResult } from './DexAdapter';
+import { BaseDexAdapter } from './BaseDexAdapter';
 import { DexProtocol } from '../../types';
 
-export class JupiterAdapter implements IDexAdapter {
+export class JupiterAdapter extends BaseDexAdapter {
   dexName: DexProtocol = 'Jupiter';
   programIds: string[] = [
     'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter V6 primary
@@ -11,10 +12,9 @@ export class JupiterAdapter implements IDexAdapter {
     'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB', // Jupiter V4
   ];
 
-  identifyTransaction(tx: RawSolanaTransaction): boolean {
-    const matched = tx.instructions.some((ix) => this.programIds.includes(ix.programId)) ||
-      (tx.logMessages && tx.logMessages.some((log) => log.includes('JUP6Lkb') || log.includes('Jupiter')));
-    return Boolean(matched);
+  override identifyTransaction(tx: RawSolanaTransaction): boolean {
+    return super.identifyTransaction(tx) ||
+      Boolean(tx.logMessages?.some((log) => log.includes('JUP6Lkb') || log.includes('Jupiter')));
   }
 
   decodeSwap(tx: RawSolanaTransaction): DecodedSwapResult | null {
@@ -36,45 +36,8 @@ export class JupiterAdapter implements IDexAdapter {
     };
   }
 
-  calculateInput(tx: RawSolanaTransaction): { mint: string; amount: number } | null {
-    const solDelta = tx.preSolBalance - tx.postSolBalance;
-    if (solDelta > 0.001) {
-      return { mint: 'So11111111111111111111111111111111111111112', amount: solDelta };
-    }
-    if (tx.preTokenBalance && tx.postTokenBalance && tx.preTokenBalance.amount > tx.postTokenBalance.amount) {
-      return {
-        mint: tx.preTokenBalance.mint,
-        amount: tx.preTokenBalance.amount - tx.postTokenBalance.amount,
-      };
-    }
-    return null;
-  }
-
-  calculateOutput(tx: RawSolanaTransaction): { mint: string; amount: number } | null {
-    const solDelta = tx.postSolBalance - tx.preSolBalance;
-    if (solDelta > 0.001) {
-      return { mint: 'So11111111111111111111111111111111111111112', amount: solDelta };
-    }
-    if (tx.preTokenBalance && tx.postTokenBalance && tx.postTokenBalance.amount > tx.preTokenBalance.amount) {
-      return {
-        mint: tx.postTokenBalance.mint,
-        amount: tx.postTokenBalance.amount - tx.preTokenBalance.amount,
-      };
-    }
-    return null;
-  }
-
-  identifyToken(tx: RawSolanaTransaction): string | null {
-    if (tx.preTokenBalance?.mint) return tx.preTokenBalance.mint;
-    if (tx.postTokenBalance?.mint) return tx.postTokenBalance.mint;
-    return null;
-  }
-
-  identifyExecutionPrice(inputAmount: number, outputAmount: number): number {
-    return inputAmount > 0 ? outputAmount / inputAmount : 0;
-  }
-
-  identifyPool(tx: RawSolanaTransaction): string | null {
+  override identifyPool(_tx: RawSolanaTransaction): string {
     return 'Jupiter-Aggregator-Route';
   }
 }
+

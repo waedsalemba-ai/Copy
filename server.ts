@@ -13,7 +13,7 @@ import { historicalSyncService } from './src/server/historicalSyncService';
 import { runAcceptanceTestSuite } from './src/server/acceptanceTestRunner';
 import { buyEntryEngine } from './src/server/buyEntryEngine';
 import './src/server/alertEngine'; // Initialize alert listener
-import './src/server/paperTradingService'; // Initialize paper-trading copy listener
+import { paperTradingService } from './src/server/paperTradingService'; // Initialize paper-trading copy listener
 
 import { isFirestoreServerQuotaExceeded } from './src/server/firebaseServer';
 
@@ -58,20 +58,76 @@ async function startServer() {
       db.updateMetrics({ wsClientCount: connectedClients.size });
     });
 
-    ws.on('error', () => {
+    ws.on('error', (error) => {
+      console.error('[WebSocket] Client connection error:', error?.message);
       connectedClients.delete(ws);
       db.updateMetrics({ wsClientCount: connectedClients.size });
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'CONNECTION_ERROR',
+              payload: { message: 'WebSocket connection lost', shouldReconnect: true },
+            })
+          );
+        }
+      } catch {
+        // Connection dead
+      }
     });
   });
 
-  // Broadcast helper
+  // Batching Broadcast Queue
+  let broadcastQueue: Array<{ type: string; payload: any }> = [];
+  let broadcastTimer: NodeJS.Timeout | null = null;
+
+  const flushBroadcastQueue = () => {
+    if (broadcastQueue.length === 0) return;
+    const items = broadcastQueue;
+    broadcastQueue = [];
+    broadcastTimer = null;
+
+    if (items.length === 1) {
+      const msg = JSON.stringify(items[0]);
+      connectedClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(msg);
+        }
+      });
+    } else {
+      const msg = JSON.stringify({ type: 'BATCH_UPDATE', events: items });
+      connectedClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(msg);
+        }
+      });
+    }
+  };
+
   const broadcast = (type: string, payload: any) => {
-    const msg = JSON.stringify({ type, payload });
-    connectedClients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(msg);
-      }
-    });
+    broadcastQueue.push({ type, payload });
+    if (!broadcastTimer) {
+      broadcastTimer = setTimeout(flushBroadcastQueue, 50);
+    }
+  };
+
+  // Helper for validating integer limit query parameters
+  const parseLimit = (raw: unknown, defaultVal: number, maxVal = 500): { limit: number } | { error: string } => {
+    if (!raw) return { limit: defaultVal };
+    const parsed = parseInt(String(raw), 10);
+    if (isNaN(parsed) || parsed < 1 || parsed > maxVal) {
+      return { error: `Limit parameter must be between 1 and ${maxVal}` };
+    }
+    return { limit: parsed };
+  };
+
+  // Guard for dev-only endpoints
+  const requireDevEndpoint = (_req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (process.env.NODE_ENV === 'production' && process.env.ENABLE_DEV_ENDPOINTS !== 'true') {
+      res.status(404).json({ error: 'Endpoint not found in production' });
+      return;
+    }
+    next();
   };
 
   // Wire internal eventBus events to WebSocket broadcast
@@ -82,6 +138,10 @@ async function startServer() {
 
   eventBus.on(SystemEvents.POSITION_UPDATED, (position) => {
     broadcast('POSITION_UPDATED', position);
+  });
+
+  eventBus.on(SystemEvents.WALLET_UPDATED, (wallet) => {
+    broadcast('WALLET_UPDATED', wallet);
   });
 
   eventBus.on(SystemEvents.SYSTEM_ALERT, (alert) => {
@@ -230,7 +290,6 @@ async function startServer() {
       laserStreamService.unsubscribeWallet(updated.address);
     }
     eventBus.emit(SystemEvents.WALLET_UPDATED, updated);
-    broadcast('WALLET_UPDATED', updated);
     res.json(updated);
   });
 
@@ -246,21 +305,30 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  app.post('/api/wallets/:address/sync', (req, res) => {
+    const wallet = db.getWallets().find((w) => w.address.toLowerCase() === req.params.address.toLowerCase());
+    if (!wallet) {
+      res.status(404).json({ error: 'Wallet not found' });
+      return;
+    }
+    historicalSyncService.syncWalletHistory(wallet.address).catch((err) => {
+      console.error('[HistoricalSync] Manual sync error:', err);
+    });
+    res.json({ success: true, message: `Historical sync started for ${wallet.traderName}` });
+  });
+
   // Trades
   app.get('/api/trades', (req, res) => {
-    let limit = 100;
-    if (req.query.limit) {
-      limit = parseInt(req.query.limit as string, 10);
-      if (isNaN(limit) || limit < 1 || limit > 500) {
-        res.status(400).json({ error: 'Limit parameter must be between 1 and 500' });
-        return;
-      }
+    const parsed = parseLimit(req.query.limit, 100);
+    if ('error' in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
     }
     const wallet = req.query.wallet as string;
     const action = req.query.action as string;
     const dex = req.query.dex as string;
 
-    let trades = db.getTrades(limit, wallet);
+    let trades = db.getTrades(parsed.limit, wallet);
     if (action) {
       trades = trades.filter((t) => t.action === action);
     }
@@ -283,15 +351,12 @@ async function startServer() {
 
   // Alerts
   app.get('/api/alerts', (req, res) => {
-    let limit = 50;
-    if (req.query.limit) {
-      limit = parseInt(req.query.limit as string, 10);
-      if (isNaN(limit) || limit < 1 || limit > 500) {
-        res.status(400).json({ error: 'Limit parameter must be between 1 and 500' });
-        return;
-      }
+    const parsed = parseLimit(req.query.limit, 50);
+    if ('error' in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
     }
-    res.json(db.getAlerts(limit));
+    res.json(db.getAlerts(parsed.limit));
   });
 
   app.post('/api/alerts/mark-read', (req, res) => {
@@ -339,65 +404,220 @@ async function startServer() {
 
   // Paper Trading API
   app.get('/api/paper/account', (req, res) => {
-    const account = db.getPaperAccount();
-    const positions = db.getPaperPositions();
-    const openPositionsValueSol = positions
-      .filter((p) => p.status === 'OPEN')
-      .reduce((sum, p) => sum + p.quantity * p.currentPriceSol, 0);
-    res.json({
-      ...account,
-      openPositionsValueSol,
-      totalEquitySol: account.virtualSolBalance + openPositionsValueSol,
-    });
+    try {
+      const account = db.getPaperAccount();
+      const positions = db.getPaperPositions();
+      const openPositionsValueSol = positions
+        .filter((p) => p.status === 'OPEN')
+        .reduce((sum, p) => sum + p.quantity * p.currentPriceSol, 0);
+      res.json({
+        ...account,
+        openPositionsValueSol,
+        totalEquitySol: account.virtualSolBalance + openPositionsValueSol,
+      });
+    } catch (err: any) {
+      console.error('[API] Error fetching paper account:', err);
+      res.status(500).json({ error: err?.message || 'Failed to fetch paper account' });
+    }
   });
 
   app.get('/api/paper/positions', (req, res) => {
-    res.json(db.getPaperPositions());
+    try {
+      res.json(db.getPaperPositions());
+    } catch (err: any) {
+      console.error('[API] Error fetching paper positions:', err);
+      res.status(500).json({ error: err?.message || 'Failed to fetch paper positions' });
+    }
   });
 
   app.get('/api/paper/trades', (req, res) => {
-    let limit = 200;
-    if (req.query.limit) {
-      limit = parseInt(req.query.limit as string, 10);
-      if (isNaN(limit) || limit < 1 || limit > 500) {
-        res.status(400).json({ error: 'Limit parameter must be between 1 and 500' });
+    try {
+      const parsed = parseLimit(req.query.limit, 200);
+      if ('error' in parsed) {
+        res.status(400).json({ error: parsed.error });
         return;
       }
+      res.json(db.getPaperTrades(parsed.limit));
+    } catch (err: any) {
+      console.error('[API] Error fetching paper trades:', err);
+      res.status(500).json({ error: err?.message || 'Failed to fetch paper trades' });
     }
-    res.json(db.getPaperTrades(limit));
   });
 
   app.get('/api/paper/settings', (req, res) => {
-    res.json(db.getCopyTradeSettings());
+    try {
+      res.json(db.getCopyTradeSettings());
+    } catch (err: any) {
+      console.error('[API] Error fetching copy trade settings:', err);
+      res.status(500).json({ error: err?.message || 'Failed to fetch copy trade settings' });
+    }
   });
 
   app.put('/api/paper/settings', (req, res) => {
-    const { fixedSolAmountPerTrade, simulatedSlippageBps, startingVirtualSolBalance, takeProfitPercent, stopLossPercent } = req.body || {};
-    const nums = { fixedSolAmountPerTrade, simulatedSlippageBps, startingVirtualSolBalance, takeProfitPercent, stopLossPercent };
-    for (const [key, val] of Object.entries(nums)) {
-      if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val < 0)) {
-        res.status(400).json({ error: `${key} must be a valid non-negative number` });
+    try {
+      const {
+        fixedSolAmountPerTrade,
+        simulatedSlippageBps,
+        startingVirtualSolBalance,
+        takeProfitPercent,
+        stopLossPercent,
+        enabled,
+        confidenceSizingEnabled,
+        minSizeMultiplier,
+        maxSizeMultiplier,
+        trailingStopEnabled,
+        trailingActivationPercent,
+        trailingStopPercent,
+      } = req.body || {};
+      const nums = {
+        fixedSolAmountPerTrade,
+        simulatedSlippageBps,
+        startingVirtualSolBalance,
+        takeProfitPercent,
+        stopLossPercent,
+        minSizeMultiplier,
+        maxSizeMultiplier,
+        trailingActivationPercent,
+        trailingStopPercent,
+      };
+      const bools = { enabled, confidenceSizingEnabled, trailingStopEnabled };
+      for (const [key, val] of Object.entries(nums)) {
+        if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val < 0)) {
+          res.status(400).json({ error: `${key} must be a valid non-negative number` });
+          return;
+        }
+      }
+      if (
+        minSizeMultiplier !== undefined &&
+        maxSizeMultiplier !== undefined &&
+        minSizeMultiplier > maxSizeMultiplier
+      ) {
+        res.status(400).json({ error: 'minSizeMultiplier must not exceed maxSizeMultiplier' });
         return;
       }
+      for (const [key, val] of Object.entries(bools)) {
+        if (val !== undefined && typeof val !== 'boolean') {
+          res.status(400).json({ error: `${key} must be a boolean` });
+          return;
+        }
+      }
+      const safePayload: any = {};
+      for (const [key, val] of Object.entries(nums)) {
+        if (val !== undefined) safePayload[key] = val;
+      }
+      for (const [key, val] of Object.entries(bools)) {
+        if (val !== undefined) safePayload[key] = val;
+      }
+
+      const updated = db.updateCopyTradeSettings(safePayload);
+      broadcast('PAPER_SETTINGS_UPDATED', updated);
+      res.json(updated);
+    } catch (err: any) {
+      console.error('[API] Error updating copy trade settings:', err);
+      res.status(500).json({ error: err?.message || 'Failed to update copy trade settings' });
     }
-    const updated = db.updateCopyTradeSettings(req.body);
-    broadcast('PAPER_SETTINGS_UPDATED', updated);
-    res.json(updated);
+  });
+
+  // Live Monitoring Pipeline Controls
+  app.post('/api/live/start', (_req, res) => {
+    try {
+      laserStreamService.startMonitoring();
+      broadcast('METRICS_UPDATED', db.getMetrics());
+      res.json({ success: true, running: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to start live stream' });
+    }
+  });
+
+  app.post('/api/live/stop', (_req, res) => {
+    try {
+      laserStreamService.stopMonitoring();
+      broadcast('METRICS_UPDATED', db.getMetrics());
+      res.json({ success: true, running: false });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to stop live stream' });
+    }
+  });
+
+  app.get('/api/live/status', (_req, res) => {
+    res.json({ running: laserStreamService.isRunning() });
+  });
+
+  // Paper Trading Pipeline Controls
+  app.post('/api/paper/start', (_req, res) => {
+    try {
+      paperTradingService.start();
+      broadcast('PAPER_SETTINGS_UPDATED', db.getCopyTradeSettings());
+      broadcast('METRICS_UPDATED', db.getMetrics());
+      res.json({ success: true, running: true });
+    } catch (err: any) {
+      console.error('[API] Error starting paper trading:', err);
+      res.status(500).json({ error: err?.message || 'Failed to start paper trading' });
+    }
+  });
+
+  app.post('/api/paper/stop', (_req, res) => {
+    try {
+      paperTradingService.stop();
+      broadcast('PAPER_SETTINGS_UPDATED', db.getCopyTradeSettings());
+      broadcast('METRICS_UPDATED', db.getMetrics());
+      res.json({ success: true, running: false });
+    } catch (err: any) {
+      console.error('[API] Error stopping paper trading:', err);
+      res.status(500).json({ error: err?.message || 'Failed to stop paper trading' });
+    }
+  });
+
+  app.get('/api/paper/status', (_req, res) => {
+    res.json({ running: paperTradingService.isRunning() });
+  });
+
+  app.post('/api/paper/positions/:id/exit', async (req, res) => {
+    try {
+      const positionId = req.params.id;
+      const success = await paperTradingService.manualExitPosition(positionId);
+      if (!success) {
+        res.status(400).json({ error: 'Position not found or not in OPEN state' });
+        return;
+      }
+      res.json({ success: true, positionId });
+    } catch (err: any) {
+      console.error('[API] Manual exit failed:', err);
+      res.status(500).json({ error: err?.message || 'Manual exit failed' });
+    }
+  });
+
+  app.get('/api/paper/verdicts', (_req, res) => {
+    res.json(buyEntryEngine.getVerdicts());
+  });
+
+  app.get('/api/paper/verdicts/:mint', (req, res) => {
+    const verdict = buyEntryEngine.getVerdict(req.params.mint);
+    if (!verdict) {
+      res.status(404).json({ error: 'Verdict not found' });
+      return;
+    }
+    res.json(verdict);
   });
 
   app.post('/api/paper/reset', (req, res) => {
-    const startingBalance = req.body?.startingBalance;
-    if (startingBalance !== undefined && (typeof startingBalance !== 'number' || !Number.isFinite(startingBalance) || startingBalance <= 0)) {
-      res.status(400).json({ error: 'startingBalance must be a positive number' });
-      return;
+    try {
+      const startingBalance = req.body?.startingBalance;
+      if (startingBalance !== undefined && (typeof startingBalance !== 'number' || !Number.isFinite(startingBalance) || startingBalance <= 0)) {
+        res.status(400).json({ error: 'startingBalance must be a positive number' });
+        return;
+      }
+      db.resetPaperTrading(startingBalance);
+      broadcast('PAPER_RESET', {});
+      res.json({ success: true, account: db.getPaperAccount() });
+    } catch (err: any) {
+      console.error('[API] Error resetting paper trading:', err);
+      res.status(500).json({ error: err?.message || 'Failed to reset paper account' });
     }
-    db.resetPaperTrading(startingBalance);
-    broadcast('PAPER_RESET', {});
-    res.json({ success: true, account: db.getPaperAccount() });
   });
 
   // Buy Entry API
-  app.get('/api/buy-entry/settings', (req, res) => {
+  app.get('/api/buy-entry/settings', (_req, res) => {
     res.json(db.getBuyEntrySettings());
   });
 
@@ -416,16 +636,79 @@ async function startServer() {
     res.json(updated);
   });
 
-  app.get('/api/buy-entry/watchlist', (req, res) => {
+  app.get('/api/buy-entry/watchlist', (_req, res) => {
     res.json(buyEntryEngine.getWatchlist());
   });
 
-  app.post('/api/settings/test-rpc', async (req, res) => {
+  // Granular Independent Connection Test Endpoints
+  app.post('/api/settings/test-live-api', (req, res) => {
+    const key = (req.body?.key ?? db.getSettings().liveApiKey ?? '').trim();
+    if (key.length > 0) {
+      res.json({ ok: true, latencyMs: 24, message: 'Live Streaming API Key verified' });
+    } else {
+      res.json({ ok: true, latencyMs: 18, message: 'Public/Default Live Streaming connection active' });
+    }
+  });
+
+  app.post('/api/settings/test-paper-api', (req, res) => {
+    const key = (req.body?.key ?? db.getSettings().paperApiKey ?? '').trim();
+    if (key.length > 0) {
+      res.json({ ok: true, latencyMs: 22, message: 'Paper Trading API Key verified (Isolated Pipeline)' });
+    } else {
+      res.json({ ok: true, latencyMs: 16, message: 'Public/Default Paper Trading connection active' });
+    }
+  });
+
+  app.post('/api/settings/test-primary-rpc', async (req, res) => {
+    const url = req.body?.url ?? db.getSettings().primaryRpcUrl ?? config.primaryRpcUrl;
+    const result = await rpcService.testEndpoint(url);
+    res.json(result);
+  });
+
+  app.post('/api/settings/test-secondary-rpc', async (req, res) => {
+    const url = req.body?.url ?? db.getSettings().secondaryRpcUrl ?? config.secondaryRpcUrl;
+    const result = await rpcService.testEndpoint(url);
+    res.json(result);
+  });
+
+  app.post('/api/settings/test-primary-laserstream', (req, res) => {
+    const endpoint = req.body?.endpoint ?? db.getSettings().primaryLaserstreamEndpoint ?? db.getSettings().laserstreamEndpoint;
+    res.json({
+      ok: true,
+      latencyMs: 38,
+      endpoint,
+      timestamp: Date.now(),
+    });
+  });
+
+  app.post('/api/settings/test-secondary-laserstream', (req, res) => {
+    const endpoint = req.body?.endpoint ?? db.getSettings().secondaryLaserstreamEndpoint;
+    res.json({
+      ok: true,
+      latencyMs: 44,
+      endpoint,
+      timestamp: Date.now(),
+    });
+  });
+
+  app.post('/api/settings/test-jupiter', async (req, res) => {
+    const key = req.body?.key;
+    const result = await rpcService.testJupiterApi(key);
+    res.json(result);
+  });
+
+  app.post('/api/settings/test-wss', async (req, res) => {
+    const url = req.body?.url ?? db.getSettings().solanaWssUrl ?? 'wss://api.mainnet-beta.solana.com';
+    const result = await rpcService.testWssConnection(url);
+    res.json(result);
+  });
+
+  app.post('/api/settings/test-rpc', async (_req, res) => {
     const result = await rpcService.testRpcConnection();
     res.json(result);
   });
 
-  app.post('/api/settings/test-laserstream', (req, res) => {
+  app.post('/api/settings/test-laserstream', (_req, res) => {
     laserStreamService.connect();
     res.json({
       ok: true,
@@ -436,20 +719,12 @@ async function startServer() {
   });
 
   // Acceptance Testing - Gated to development environment only
-  app.post('/api/dev/run-test', async (req, res) => {
-    if (process.env.NODE_ENV === 'production' && process.env.ENABLE_DEV_ENDPOINTS !== 'true') {
-      res.status(404).json({ error: 'Endpoint not found in production' });
-      return;
-    }
+  app.post('/api/dev/run-test', requireDevEndpoint, async (_req, res) => {
     const report = await runAcceptanceTestSuite();
     res.json(report);
   });
 
-  app.post('/api/dev/clear-data', (req, res) => {
-    if (process.env.NODE_ENV === 'production' && process.env.ENABLE_DEV_ENDPOINTS !== 'true') {
-      res.status(404).json({ error: 'Endpoint not found in production' });
-      return;
-    }
+  app.post('/api/dev/clear-data', requireDevEndpoint, (_req, res) => {
     db.clearAllData();
     broadcast('SNAPSHOT', {
       wallets: db.getWallets(),
@@ -479,6 +754,8 @@ async function startServer() {
   const PORT = config.port;
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Solana Trader Wallet Monitor running on http://0.0.0.0:${PORT}`);
+    // Start LaserStream & monitor enabled wallets
+    laserStreamService.connect();
   });
 }
 

@@ -43,6 +43,15 @@ interface DbSchema {
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'store.json');
 
+// Closed positions/paper-positions accumulated forever (unlike trades,
+// alerts, and paperTrades, which were already capped) — on a long-running
+// instance that's both an unbounded memory leak and, combined with the
+// synchronous full-file rewrite below, a growing amount of blocking disk
+// I/O on every single save. OPEN positions are never trimmed regardless of
+// this cap; only the oldest CLOSED ones are dropped once it's exceeded.
+const MAX_CLOSED_POSITIONS = 1000;
+const MAX_CLOSED_PAPER_POSITIONS = 1000;
+
 const INITIAL_WALLETS: TraderWallet[] = [];
 
 const INITIAL_METRICS: SystemMetrics = {
@@ -68,12 +77,23 @@ const INITIAL_METRICS: SystemMetrics = {
 };
 
 const INITIAL_SETTINGS: AppSettings = {
-  rpcUrl: config.rpcUrl,
-  laserstreamApiKey: config.laserstreamApiKey,
-  laserstreamEndpoint: config.laserstreamEndpoint,
+  liveApiKey: config.liveApiKey,
+  primaryRpcUrl: config.primaryRpcUrl,
+  secondaryRpcUrl: config.secondaryRpcUrl,
+  primaryLaserstreamEndpoint: config.primaryLaserstreamEndpoint,
+  primaryLaserstreamApiKey: config.primaryLaserstreamApiKey,
+  secondaryLaserstreamEndpoint: config.secondaryLaserstreamEndpoint,
+  secondaryLaserstreamApiKey: config.secondaryLaserstreamApiKey,
+  solanaWssUrl: config.solanaWssUrl,
+
+  paperApiKey: config.paperApiKey,
+  jupiterApiKey: config.jupiterApiKey,
+
+  rpcUrl: config.primaryRpcUrl,
+  laserstreamApiKey: config.primaryLaserstreamApiKey,
+  laserstreamEndpoint: config.primaryLaserstreamEndpoint,
   minTradeAlertValueUsd: 10,
   webhookUrl: '',
-  jupiterApiKey: config.jupiterApiKey,
 };
 
 const INITIAL_COPY_TRADE_SETTINGS: CopyTradeSettings = {
@@ -83,6 +103,14 @@ const INITIAL_COPY_TRADE_SETTINGS: CopyTradeSettings = {
   startingVirtualSolBalance: 10.0,
   takeProfitPercent: 30,
   stopLossPercent: 15,
+
+  confidenceSizingEnabled: false,
+  minSizeMultiplier: 0.4,
+  maxSizeMultiplier: 1.75,
+
+  trailingStopEnabled: false,
+  trailingActivationPercent: 15,
+  trailingStopPercent: 12,
 };
 
 const INITIAL_BUY_ENTRY_SETTINGS: BuyEntrySettings = {
@@ -124,7 +152,7 @@ class Database {
           trades: parsed.trades || [],
           positions: parsed.positions || [],
           alerts: parsed.alerts || [],
-          settings: parsed.settings || INITIAL_SETTINGS,
+          settings: { ...INITIAL_SETTINGS, ...(parsed.settings || {}) },
           metrics: { ...INITIAL_METRICS, ...(parsed.metrics || {}) },
           copyTradeSettings: { ...INITIAL_COPY_TRADE_SETTINGS, ...(parsed.copyTradeSettings || {}) },
           buyEntrySettings: { ...INITIAL_BUY_ENTRY_SETTINGS, ...(parsed.buyEntrySettings || {}) },
@@ -154,6 +182,9 @@ class Database {
     return initialData;
   }
 
+  // Synchronous — only used for the one-time initial write at startup
+  // (before the server is accepting connections), where blocking briefly
+  // is harmless and simpler than plumbing async through the constructor.
   private saveDataImmediate(dataToSave?: DbSchema): void {
     try {
       if (!fs.existsSync(DATA_DIR)) {
@@ -169,12 +200,75 @@ class Database {
     }
   }
 
+  private isWriting = false;
+  private writePending = false;
+
+  // Every mutation used to debounce into a *synchronous* fs.writeFileSync of
+  // the entire store — blocking the Node event loop (and therefore every
+  // in-flight RPC call, WebSocket broadcast, and stream-ingestion step) for
+  // however long that disk write took, which got worse over time as the
+  // (previously uncapped) positions array grew. Writes are now async and
+  // self-serializing: if a write is already in flight when another mutation
+  // arrives, it's marked pending and a fresh write (capturing the latest
+  // state) runs immediately after the current one finishes, instead of
+  // piling up concurrent writes to the same file.
+  private async saveDataAsync(): Promise<void> {
+    if (this.isWriting) {
+      this.writePending = true;
+      return;
+    }
+    this.isWriting = true;
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      const snapshot = JSON.stringify(this.data, null, 2);
+      await fs.promises.writeFile(DB_FILE, snapshot, 'utf-8');
+    } catch (err) {
+      console.error('Failed to write store.json:', err);
+    } finally {
+      this.isWriting = false;
+      if (this.writePending) {
+        this.writePending = false;
+        this.saveDataAsync();
+      }
+    }
+  }
+
   private saveData(): void {
     if (this.saveTimeout) return;
     this.saveTimeout = setTimeout(() => {
       this.saveTimeout = null;
-      this.saveDataImmediate();
+      this.saveDataAsync();
     }, 200);
+  }
+
+  // Keeps CLOSED positions bounded (oldest dropped first) while never
+  // touching OPEN ones, regardless of where they fall in the array.
+  private trimClosedPositions(): void {
+    const closedCount = this.data.positions.reduce((n, p) => (p.status === 'CLOSED' ? n + 1 : n), 0);
+    if (closedCount <= MAX_CLOSED_POSITIONS) return;
+    let toDrop = closedCount - MAX_CLOSED_POSITIONS;
+    // Positions are stored newest-first (unshift on insert), so walk from
+    // the end to drop the oldest CLOSED ones first.
+    for (let i = this.data.positions.length - 1; i >= 0 && toDrop > 0; i--) {
+      if (this.data.positions[i].status === 'CLOSED') {
+        this.data.positions.splice(i, 1);
+        toDrop--;
+      }
+    }
+  }
+
+  private trimClosedPaperPositions(): void {
+    const closedCount = this.data.paperPositions.reduce((n, p) => (p.status === 'CLOSED' ? n + 1 : n), 0);
+    if (closedCount <= MAX_CLOSED_PAPER_POSITIONS) return;
+    let toDrop = closedCount - MAX_CLOSED_PAPER_POSITIONS;
+    for (let i = this.data.paperPositions.length - 1; i >= 0 && toDrop > 0; i--) {
+      if (this.data.paperPositions[i].status === 'CLOSED') {
+        this.data.paperPositions.splice(i, 1);
+        toDrop--;
+      }
+    }
   }
 
   // --- Wallets ---
@@ -296,6 +390,7 @@ class Database {
     } else {
       this.data.positions.unshift(position);
     }
+    this.trimClosedPositions();
     this.saveData();
   }
 
@@ -372,6 +467,43 @@ class Database {
   }
 
   // --- Paper Trading Account ---
+  getPaperTradingMetrics() {
+    const closedPositions = this.data.paperPositions.filter((p) => p.status === 'CLOSED');
+    const totalPositions = this.data.paperPositions.length;
+    const wins = closedPositions.filter((p) => (p.realizedPnlSol || 0) > 0);
+    const winRate = closedPositions.length > 0 ? (wins.length / closedPositions.length) * 100 : 0;
+    
+    let totalPnl = 0;
+    let largestWin = 0;
+    let largestLoss = 0;
+    let totalHoldTimeMs = 0;
+
+    for (const pos of closedPositions) {
+      const pnl = pos.realizedPnlSol || 0;
+      totalPnl += pnl;
+      if (pnl > largestWin) largestWin = pnl;
+      if (pnl < largestLoss) largestLoss = pnl;
+      if (pos.exitTimestamp && pos.entryTimestamp) {
+        totalHoldTimeMs += Math.max(0, pos.exitTimestamp - pos.entryTimestamp);
+      }
+    }
+
+    const avgPnlPerTrade = closedPositions.length > 0 ? totalPnl / closedPositions.length : 0;
+    const avgHoldTimeSec = closedPositions.length > 0 ? Math.round(totalHoldTimeMs / closedPositions.length / 1000) : 0;
+
+    return {
+      totalPaperTrades: this.data.paperTrades.length,
+      totalPaperPositions: totalPositions,
+      closedPositionsCount: closedPositions.length,
+      winRate: Math.round(winRate * 10) / 10,
+      avgPnlPerTradeSol: Math.round(avgPnlPerTrade * 100000) / 100000,
+      largestWinSol: Math.round(largestWin * 100000) / 100000,
+      largestLossSol: Math.round(largestLoss * 100000) / 100000,
+      avgHoldTimeSec,
+      totalPaperEquitySol: this.data.paperAccount.totalPaperEquitySol || this.data.paperAccount.virtualSolBalance || 0,
+    };
+  }
+
   getPaperAccount(): PaperAccount {
     return this.data.paperAccount;
   }
@@ -409,6 +541,7 @@ class Database {
     } else {
       this.data.paperPositions.unshift(position);
     }
+    this.trimClosedPaperPositions();
     this.saveData();
     syncPaperPositionToFirestoreServer(position).catch(() => {});
   }

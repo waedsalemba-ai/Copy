@@ -1,7 +1,56 @@
 import { Position, CanonicalTradeEvent } from '../types';
 import { db } from './db';
+import { rpcService } from './rpcService';
+import { eventBus, SystemEvents } from './eventBus';
+
+const LIVE_PRICE_REFRESH_MS = 5000;
 
 export class PositionEngine {
+  private refreshTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this.refreshTimer = setInterval(() => {
+      this.refreshOpenPositionPrices().catch((err) => {
+        console.error('[PositionEngine] Live price refresh failed:', err);
+      });
+    }, LIVE_PRICE_REFRESH_MS);
+  }
+
+  public stopInterval(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  }
+
+  public async refreshOpenPositionPrices(): Promise<void> {
+    const openPositions = db.getPositions().filter((p) => p.status === 'OPEN');
+    if (openPositions.length === 0) return;
+
+    const affectedWallets = new Set<string>();
+
+    try {
+      const prices = await rpcService.getPricesBatch(openPositions.map((p) => p.tokenMint));
+
+      for (const position of openPositions) {
+        const meta = prices.get(position.tokenMint);
+        const freshPrice = meta?.priceSol;
+        if (!freshPrice || freshPrice <= 0) continue;
+
+        position.currentPriceSol = freshPrice;
+        position.unrealizedPnlSol = position.currentQuantity * freshPrice - position.remainingCostBasisSol;
+
+        db.savePosition(position);
+        affectedWallets.add(position.walletAddress);
+        eventBus.emit(SystemEvents.POSITION_UPDATED, position);
+      }
+
+      affectedWallets.forEach((walletAddress) => this.updateTraderMetrics(walletAddress));
+    } catch (err) {
+      console.error('[PositionEngine] Price batch fetch failed:', err);
+    }
+  }
+
   public processTrade(trade: CanonicalTradeEvent): Position | null {
     // Only BUY and SELL affect position tracking
     if (trade.action !== 'BUY' && trade.action !== 'SELL') {
@@ -185,6 +234,11 @@ export class PositionEngine {
         largestLossSol: Number(largestLoss.toFixed(2)),
       },
     });
+
+    const updatedWallet = db.getWalletByAddress(walletAddress);
+    if (updatedWallet) {
+      eventBus.emit(SystemEvents.WALLET_UPDATED, updatedWallet);
+    }
   }
 }
 

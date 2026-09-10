@@ -21,6 +21,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { CanonicalTradeEvent, TokenRiskAnalysis, TokenRiskLevel } from '../types';
+import { formatAddress, formatSol, formatUsd, formatTokenQuantity } from '../utils/formatters';
 
 const RISK_STYLES: Record<TokenRiskLevel, { bg: string; text: string; border: string; label: string }> = {
   LOW: { bg: 'bg-[#00FF88]/10', text: 'text-[#00FF88]', border: 'border-[#00FF88]/30', label: 'LOW' },
@@ -135,39 +136,33 @@ export const LiveTradesFeed: React.FC<LiveTradesFeedProps> = ({ trades, limit })
     }
   };
 
-  // De-duplicate by token: keep only the most recent trade per tokenMint so
-  // the stream reads as one row per token rather than repeating it on every
-  // trade. `trades` arrives newest-first, so the first occurrence we see
-  // for a given mint is already its latest trade.
-  const dedupedTrades = React.useMemo(() => {
-    const seen = new Set<string>();
-    const result: CanonicalTradeEvent[] = [];
+  // Filter trades across the live stream, deduplicating only by trade ID (not token mint)
+  const filteredTrades = React.useMemo(() => {
+    const seenIds = new Set<string>();
+    const matched: CanonicalTradeEvent[] = [];
+
     for (const t of trades) {
-      if (seen.has(t.tokenMint)) continue;
-      seen.add(t.tokenMint);
-      result.push(t);
+      if (seenIds.has(t.id)) continue;
+      seenIds.add(t.id);
+
+      if (searchTerm) {
+        const q = searchTerm.toLowerCase();
+        const matchTrader = t.traderName.toLowerCase().includes(q);
+        const matchWallet = t.walletAddress.toLowerCase().includes(q);
+        const matchToken = t.tokenSymbol.toLowerCase().includes(q) || t.tokenMint.toLowerCase().includes(q);
+        const matchSig = t.signature.toLowerCase().includes(q);
+        if (!matchTrader && !matchWallet && !matchToken && !matchSig) continue;
+      }
+
+      if (selectedAction !== 'ALL' && t.action !== selectedAction) continue;
+      if (selectedDex !== 'ALL' && t.dex !== selectedDex) continue;
+      if (minSol > 0 && t.solAmount < minSol) continue;
+
+      matched.push(t);
     }
-    return result;
-  }, [trades]);
 
-  const displayList = limit ? dedupedTrades.slice(0, limit) : dedupedTrades;
-
-  const filteredTrades = displayList.filter((t) => {
-    if (searchTerm) {
-      const q = searchTerm.toLowerCase();
-      const matchTrader = t.traderName.toLowerCase().includes(q);
-      const matchWallet = t.walletAddress.toLowerCase().includes(q);
-      const matchToken = t.tokenSymbol.toLowerCase().includes(q) || t.tokenMint.toLowerCase().includes(q);
-      const matchSig = t.signature.toLowerCase().includes(q);
-      if (!matchTrader && !matchWallet && !matchToken && !matchSig) return false;
-    }
-
-    if (selectedAction !== 'ALL' && t.action !== selectedAction) return false;
-    if (selectedDex !== 'ALL' && t.dex !== selectedDex) return false;
-    if (minSol > 0 && t.solAmount < minSol) return false;
-
-    return true;
-  });
+    return limit ? matched.slice(0, limit) : matched;
+  }, [trades, searchTerm, selectedAction, selectedDex, minSol, limit]);
 
   const getActionBadge = (action: string) => {
     switch (action) {
@@ -323,9 +318,7 @@ export const LiveTradesFeed: React.FC<LiveTradesFeedProps> = ({ trades, limit })
                         }`}
                       >
                         <span>
-                          {t.walletAddress && t.walletAddress.length > 8
-                            ? `${t.walletAddress.slice(0, 4)}...${t.walletAddress.slice(-4)}`
-                            : t.walletAddress || '-'}
+                          {formatAddress(t.walletAddress)}
                         </span>
                         {copiedAddress === t.walletAddress ? (
                           <Check className="w-2.5 h-2.5 text-[#00FF88]" />
@@ -348,9 +341,7 @@ export const LiveTradesFeed: React.FC<LiveTradesFeedProps> = ({ trades, limit })
                         }`}
                       >
                         <span>
-                          {t.tokenMint && t.tokenMint.length > 8
-                            ? `${t.tokenMint.slice(0, 4)}...${t.tokenMint.slice(-4)}`
-                            : t.tokenMint || '-'}
+                          {formatAddress(t.tokenMint)}
                         </span>
                         {copiedAddress === t.tokenMint ? (
                           <>
@@ -371,16 +362,12 @@ export const LiveTradesFeed: React.FC<LiveTradesFeedProps> = ({ trades, limit })
                       <VolMcBadge risk={t.riskAnalysis} />
                     </td>
                     <td className="py-2 px-2.5 text-right font-medium">
-                      {t.tokenAmount
-                        ? t.tokenAmount >= 1000
-                          ? t.tokenAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                          : t.tokenAmount.toFixed(4)
-                        : '-'}
+                      {t.tokenAmount ? formatTokenQuantity(t.tokenAmount) : '-'}
                     </td>
                     <td className="py-2 px-2.5 text-right font-bold text-[#00FF88]">
-                      {t.solAmount > 0 ? `${t.solAmount.toFixed(2)} SOL` : '-'}
+                      {t.solAmount > 0 ? formatSol(t.solAmount) : '-'}
                       <div className="text-[9px] text-[#71717a] font-normal">
-                        ${t.usdValue.toFixed(0)}
+                        {formatUsd(t.usdValue)}
                       </div>
                     </td>
                     <td className="py-2 px-2.5 text-right text-[#a1a1aa]">
@@ -488,7 +475,7 @@ export const LiveTradesFeed: React.FC<LiveTradesFeedProps> = ({ trades, limit })
               <div className="p-2.5 rounded bg-[#09090b] border border-[#27272a]">
                 <span className="text-[#71717a]">SOL Value:</span>
                 <p className="font-bold text-[#00FF88]">
-                  {selectedTrade.solAmount} SOL (${selectedTrade.usdValue.toFixed(2)})
+                  {formatSol(selectedTrade.solAmount)} ({formatUsd(selectedTrade.usdValue, 2)})
                 </p>
               </div>
 

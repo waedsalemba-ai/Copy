@@ -3,18 +3,15 @@ import {
   Plus,
   Search,
   Users,
-  Shield,
   Trash2,
   Edit2,
   Check,
   X,
   ExternalLink,
-  DollarSign,
-  TrendingUp,
-  Activity,
   AlertCircle,
 } from 'lucide-react';
 import { TraderWallet, Position, CanonicalTradeEvent } from '../types';
+import { formatAddress, formatSol } from '../utils/formatters';
 
 interface WalletsViewProps {
   wallets: TraderWallet[];
@@ -67,7 +64,7 @@ export const WalletsView: React.FC<WalletsViewProps> = ({
     try {
       await onAddWallet({
         address: addressInput.trim(),
-        traderName: nameInput.trim() || (addressInput.trim().length > 8 ? `Trader ${addressInput.trim().slice(0, 4)}...${addressInput.trim().slice(-4)}` : addressInput.trim()),
+        traderName: nameInput.trim() || (addressInput.trim().length > 8 ? `Trader ${formatAddress(addressInput.trim())}` : addressInput.trim()),
         description: descInput.trim() || 'Monitored Smart Money Wallet',
         group: groupInput,
         priority: priorityInput,
@@ -184,7 +181,7 @@ export const WalletsView: React.FC<WalletsViewProps> = ({
                 <div className="grid grid-cols-2 gap-1.5 text-[10px] mb-2">
                   <div className="p-1.5 rounded bg-[#09090b] border border-[#27272a]">
                     <span className="text-[#71717a] block">SOL Balance:</span>
-                    <span className="font-bold text-[#00FF88]">{w.solBalance.toFixed(2)} SOL</span>
+                    <span className="font-bold text-[#00FF88]">{formatSol(w.solBalance)}</span>
                   </div>
                   <div className="p-1.5 rounded bg-[#09090b] border border-[#27272a]">
                     <span className="text-[#71717a] block">Win Rate:</span>
@@ -367,7 +364,7 @@ export const WalletsView: React.FC<WalletsViewProps> = ({
               <div className="p-2.5 rounded bg-[#09090b] border border-[#27272a]">
                 <span className="text-[#71717a] block">SOL Balance:</span>
                 <span className="text-sm font-bold text-[#00FF88]">
-                  {selectedTrader.solBalance.toFixed(2)} SOL
+                  {formatSol(selectedTrader.solBalance)}
                 </span>
               </div>
               <div className="p-2.5 rounded bg-[#09090b] border border-[#27272a]">

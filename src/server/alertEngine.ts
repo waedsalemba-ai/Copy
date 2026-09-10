@@ -42,7 +42,13 @@ export class AlertEngine {
     const wallet = db.getWalletByAddress(trade.walletAddress);
     const alertSettings = wallet?.alertSettings;
 
-    if (trade.action === 'BUY' && alertSettings?.buyAlert !== false) {
+    // Global minimum USD trade value below which buy/sell alerts are
+    // suppressed entirely (large-trade alerts use their own SOL threshold
+    // below and are intentionally not gated by this).
+    const minUsd = db.getSettings().minTradeAlertValueUsd || 0;
+    const meetsMinUsd = trade.usdValue >= minUsd;
+
+    if (trade.action === 'BUY' && alertSettings?.buyAlert !== false && meetsMinUsd) {
       this.emitAlert({
         type: 'BUY',
         title: `🟢 BUY Alert - ${trade.traderName}`,
@@ -52,7 +58,7 @@ export class AlertEngine {
         signature: trade.signature,
         usdValue: trade.usdValue,
       });
-    } else if (trade.action === 'SELL' && alertSettings?.sellAlert !== false) {
+    } else if (trade.action === 'SELL' && alertSettings?.sellAlert !== false && meetsMinUsd) {
       this.emitAlert({
         type: 'SELL',
         title: `🔴 SELL Alert - ${trade.traderName}`,
