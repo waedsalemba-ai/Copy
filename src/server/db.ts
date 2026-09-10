@@ -530,7 +530,7 @@ class Database {
       (p) =>
         p.sourceWalletAddress.toLowerCase() === walletAddress.toLowerCase() &&
         p.tokenMint === tokenMint &&
-        p.status === 'OPEN'
+        p.status !== 'CLOSED' // FIXED: Catches OPEN, EXIT_PENDING, and PAPER_SELLING to prevent concurrent position openings
     );
   }
 

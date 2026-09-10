@@ -189,10 +189,17 @@ export class PaperTradingService {
     freshPrice: number | undefined,
     exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP'
   ): Promise<void> {
+    // Guard against concurrent exits for the same position
+    if (this.pendingSellKeys.has(position.id)) {
+      return;
+    }
+    this.pendingSellKeys.add(position.id);
+
     const originalStatus = position.status;
     
     // Don't exit if already closing/closed
     if (originalStatus !== 'OPEN') {
+      this.pendingSellKeys.delete(position.id);
       return;
     }
 
@@ -213,7 +220,7 @@ export class PaperTradingService {
     } catch (err) {
       console.error(`[PaperTrading] TPSL exit failed for position ${position.id}:`, err);
       
-      // Restore original state on failure
+      // Restore original state on failure (safe because we hold the pendingSellKeys lock)
       position.status = originalStatus;
       db.savePaperPosition(position);
       
@@ -230,6 +237,8 @@ export class PaperTradingService {
         timestamp: Date.now(),
         read: false,
       });
+    } finally {
+      this.pendingSellKeys.delete(position.id);
     }
   }
 
@@ -441,16 +450,13 @@ export class PaperTradingService {
 
     try {
       // Check for existing position in any active state (don't allow concurrent positions)
-      const existingOpenPosition = db.getPaperPosition(trade.walletAddress, trade.tokenMint);
-      if (existingOpenPosition) {
-        // Reject if position is not CLOSED (includes OPEN, EXIT_PENDING, PAPER_SELLING)
-        if (existingOpenPosition.status !== 'CLOSED') {
-          console.warn(
-            `[PaperTrading] Cannot open new position for ${trade.tokenSymbol}: ` +
-            `existing position in ${existingOpenPosition.status} state`
-          );
-          return false;
-        }
+      const existingActivePosition = db.getPaperPosition(trade.walletAddress, trade.tokenMint);
+      if (existingActivePosition) {
+        console.warn(
+          `[PaperTrading] Cannot open new position for ${trade.tokenSymbol}: ` +
+          `existing position already in ${existingActivePosition.status} state`
+        );
+        return false;
       }
 
       const MIN_TRADABLE_SOL = 0.000001; // 1,000 lamports
@@ -614,7 +620,7 @@ export class PaperTradingService {
 
     db.addPaperTrade(paperTrade);
     db.savePaperPosition(newPosition);
-    this.recomputeAccountMetrics();
+    this.recomputeAccountMetrics(true); // FIXED: Force immediate equity recalculation
 
     eventBus.emit(SystemEvents.PAPER_POSITION_UPDATED, newPosition);
     eventBus.emit(SystemEvents.PAPER_TRADE_EXECUTED, paperTrade);
@@ -658,8 +664,19 @@ export class PaperTradingService {
     if (!position || position.status !== 'OPEN') {
       return false;
     }
-    await this.executePaperSellExit(position, position.currentPriceSol, 'MANUAL');
-    return true;
+
+    // Guard against concurrent exits
+    if (this.pendingSellKeys.has(position.id)) {
+      return false;
+    }
+    this.pendingSellKeys.add(position.id);
+
+    try {
+      await this.executePaperSellExit(position, position.currentPriceSol, 'MANUAL');
+      return true;
+    } finally {
+      this.pendingSellKeys.delete(position.id);
+    }
   }
 
   public isRunning(): boolean {
@@ -753,7 +770,7 @@ export class PaperTradingService {
 
     db.addPaperTrade(paperTrade);
     db.savePaperPosition(position);
-    this.recomputeAccountMetrics();
+    this.recomputeAccountMetrics(true); // FIXED: Force immediate equity recalculation
 
     eventBus.emit(SystemEvents.PAPER_POSITION_UPDATED, position);
     eventBus.emit(SystemEvents.PAPER_TRADE_EXECUTED, paperTrade);
