@@ -26,13 +26,13 @@ export async function getCachedJupiterPrice(tokenMint: string): Promise<number |
   }
 
   try {
-    const price = await rpcService.getJupiterPrice(tokenMint);
+    const price = await jupiterCoordinator.getTokenPrice(tokenMint, JupiterPriority.LOW);
     if (price !== null) {
       jupiterPriceCache.set(tokenMint, { price, timestamp: now });
     }
     return price ?? (cached ? cached.price : null);
   } catch (err) {
-    console.warn(`[RPC] Failed to fetch price for ${tokenMint}, using stale cache if available`);
+    console.warn(`[Jupiter] Fetch failed for ${tokenMint}, using stale cache if available`);
     return cached ? cached.price : null; // Fallback to stale cache on error instead of failing
   }
 }
@@ -869,11 +869,11 @@ export class RpcService {
   }
 
   public async getJupiterPrice(tokenMint: string): Promise<number | null> {
-    return jupiterCoordinator.getTokenPrice(tokenMint, JupiterPriority.LOW);
+    return getCachedJupiterPrice(tokenMint);
   }
 
   private async fetchPriceFromJupiter(tokenMint: string): Promise<number | null> {
-    return jupiterCoordinator.getTokenPrice(tokenMint, JupiterPriority.LOW);
+    return getCachedJupiterPrice(tokenMint);
   }
 
   public async getExecutionQuote(
