@@ -405,8 +405,8 @@ async function startServer() {
       }
     }
     if (jupiterApiKey !== undefined && typeof jupiterApiKey === 'string' && jupiterApiKey.trim() !== '') {
-      if (!jupiterApiKey.trim().startsWith('jup')) {
-        res.status(400).json({ error: 'Jupiter API key must start with "jup"' });
+      if (!jupiterApiKey.trim().toLowerCase().startsWith('jup')) {
+        res.status(400).json({ error: 'Jupiter API key must start with "JUP" or "jup"' });
         return;
       }
     }

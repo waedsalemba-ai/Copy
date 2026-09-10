@@ -2,6 +2,8 @@ import { Connection, PublicKey, type VersionedTransactionResponse, type Confirme
 import { WebSocket } from 'ws';
 import { db } from './db';
 import { config } from './config';
+import { solPriceService } from './solPriceService';
+import { jupiterCoordinator, JupiterPriority } from './jupiterRequestCoordinator';
 
 // Rate limiter queue for outgoing RPC requests to prevent burst 429 errors
 export class RpcRateLimiter {
@@ -237,11 +239,6 @@ export class RpcService {
   // only gives a USD figure and we need to convert to SOL (or vice versa).
   // Starts from the config constant (a fixed benchmark) but is kept fresh
   // in the background via Jupiter so it doesn't silently drift from the
-  // real market price the way a hardcoded constant would.
-  private solPriceUsd = config.solPriceUsd;
-  private solPriceUpdatedAt = 0;
-  private solPriceRefreshTimer: NodeJS.Timeout | null = null;
-
   constructor() {
     this.live = new IsolatedRpcManager('live', this);
     this.paper = new IsolatedRpcManager('paper', this);
@@ -255,63 +252,11 @@ export class RpcService {
         fetchedAt: mint === SOL_MINT ? Infinity : SEED_PRICE_TTL_MS,
       });
     });
-
-    this.refreshSolUsdPrice().catch(() => {});
-    this.solPriceRefreshTimer = setInterval(() => {
-      this.refreshSolUsdPrice().catch(() => {});
-    }, SOL_USD_REFRESH_INTERVAL_MS);
   }
 
   /** Current best-known live SOL/USD price (never the stale config constant once a live read has landed). */
   public getSolPriceUsd(): number {
-    return this.solPriceUsd > 0 ? this.solPriceUsd : config.solPriceUsd;
-  }
-
-  private jupiterCooldownUntil = 0;
-
-  private handleJupiter429(status: number, context: string): void {
-    if (status === 429) {
-      const wasInCooldown = Date.now() < this.jupiterCooldownUntil;
-      this.jupiterCooldownUntil = Date.now() + 60_000;
-      if (!wasInCooldown) {
-        console.info(`[Jupiter API] Rate limit hit (HTTP 429) during ${context}. Pausing Jupiter API requests for 60s and using DexScreener/cached prices.`);
-      }
-    }
-  }
-
-  private async refreshSolUsdPrice(): Promise<void> {
-    if (Date.now() < this.jupiterCooldownUntil) return;
-
-    try {
-      const apiKey = db.getSettings().jupiterApiKey?.trim();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
-      const res = await fetch(`${JUPITER_API_BASE}/price/v3?ids=${SOL_MINT}`, {
-        signal: controller.signal,
-        headers: apiKey ? { 'x-api-key': apiKey } : undefined,
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
-        if (res.status === 429) {
-          this.handleJupiter429(res.status, 'SOL price refresh');
-        } else {
-          const body = await res.text().catch(() => '');
-          console.warn(`[Jupiter] SOL price fetch failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
-        }
-        return;
-      }
-      const data = await res.json();
-      const usd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
-      if (usd > 0) {
-        this.solPriceUsd = usd;
-        this.solPriceUpdatedAt = Date.now();
-      } else {
-        console.warn('[Jupiter] SOL price fetch returned no usable price:', JSON.stringify(data).slice(0, 200));
-      }
-    } catch (err) {
-      console.warn('[Jupiter] SOL price fetch threw:', err instanceof Error ? err.message : err);
-      // Keep the last known value (or the config fallback) on failure.
-    }
+    return solPriceService.getSolPriceUsd();
   }
 
   // Evicts the oldest entries (Map insertion order) once a cache exceeds
@@ -795,64 +740,7 @@ export class RpcService {
   }
 
   private async fetchPricesFromJupiterBatch(mints: string[]): Promise<Map<string, number>> {
-    const result = new Map<string, number>();
-    if (Date.now() < this.jupiterCooldownUntil || mints.length === 0) {
-      return result;
-    }
-
-    const validMints = Array.from(new Set(mints.filter((m) => m && m !== 'UNKNOWN' && m !== SOL_MINT)));
-    if (validMints.length === 0) return result;
-
-    const chunkSize = 50;
-    for (let i = 0; i < validMints.length; i += chunkSize) {
-      if (Date.now() < this.jupiterCooldownUntil) break;
-      const chunk = validMints.slice(i, i + chunkSize);
-      const ids = [...chunk, SOL_MINT].join(',');
-
-      try {
-        const apiKey = db.getSettings().jupiterApiKey?.trim();
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
-        const res = await fetch(`${JUPITER_API_BASE}/price/v3?ids=${ids}`, {
-          signal: controller.signal,
-          headers: apiKey ? { 'x-api-key': apiKey } : undefined,
-        });
-        clearTimeout(timeoutId);
-
-        if (!res.ok) {
-          if (res.status === 429) {
-            this.handleJupiter429(res.status, 'batch price fetch');
-          } else {
-            const body = await res.text().catch(() => '');
-            console.warn(`[Jupiter] Batch price fetch failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
-          }
-          continue;
-        }
-
-        const data = await res.json();
-        const solUsd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
-        if (solUsd > 0) {
-          this.solPriceUsd = solUsd;
-          this.solPriceUpdatedAt = Date.now();
-        }
-
-        const solRate = solUsd > 0 ? solUsd : this.getSolPriceUsd();
-
-        for (const mint of chunk) {
-          const tokenUsd = parseFloat(data?.data?.[mint]?.usdPrice ?? data?.[mint]?.usdPrice);
-          if (tokenUsd > 0 && solRate > 0) {
-            const priceSol = tokenUsd / solRate;
-            this.priceCache.set(mint, { priceSol, fetchedAt: Date.now() });
-            this.evictOldestIfNeeded(this.priceCache, META_CACHE_MAX_ENTRIES);
-            result.set(mint, priceSol);
-          }
-        }
-      } catch {
-        // Quiet fallback on network error
-      }
-    }
-
-    return result;
+    return jupiterCoordinator.getBatchPrices(mints, JupiterPriority.MEDIUM);
   }
 
   // Fetches prices for many mints in a single Jupiter batch call, falling back to DexScreener if needed.
@@ -861,7 +749,7 @@ export class RpcService {
     if (uniqueMints.length === 0) return new Map();
 
     const staleMints = uniqueMints.filter((m) => !this.isPriceFresh(m));
-    if (staleMints.length > 0 && Date.now() >= this.jupiterCooldownUntil) {
+    if (staleMints.length > 0) {
       await this.fetchPricesFromJupiterBatch(staleMints);
     }
 
@@ -897,7 +785,7 @@ export class RpcService {
       // Symbol/decimals/name already known — only the price needs refreshing,
       // so use the lighter/faster Jupiter price endpoint first.
       let price: number | null = null;
-      if (Date.now() >= this.jupiterCooldownUntil) {
+      if (!jupiterCoordinator.isInCooldown()) {
         price = await this.fetchPriceFromJupiter(tokenMint);
       }
       if (price !== null) {
@@ -911,7 +799,7 @@ export class RpcService {
       // which only DexScreener gives us, AND we still want Jupiter's price
       // (more reliable / lower-latency) rather than DexScreener's if both
       // are available.
-      const fetchJup = Date.now() >= this.jupiterCooldownUntil
+      const fetchJup = !jupiterCoordinator.isInCooldown()
         ? this.fetchPriceFromJupiter(tokenMint)
         : Promise.resolve(null);
       const [dex, jupPrice] = await Promise.all([
@@ -949,120 +837,20 @@ export class RpcService {
   }
 
   public async getJupiterPrice(tokenMint: string): Promise<number | null> {
-    return this.fetchPriceFromJupiter(tokenMint);
+    return jupiterCoordinator.getTokenPrice(tokenMint, JupiterPriority.LOW);
   }
 
-  // Fast path: Jupiter's price API is purpose-built for Solana token pricing
-  // and returns a small payload — cheaper and typically lower-latency than
-  // pulling a full DexScreener pair list just to re-read one field.
-  //
-  // This uses Price API V3 on api.jup.ag. The old lite-api.jup.ag + Price V2
-  // (which this previously called) are both being retired by Jupiter, and
-  // V3 only returns USD prices — it dropped the vsToken param V2 had for
-  // getting a price directly in SOL. So this fetches both the target mint
-  // and SOL in one request and derives priceSol as a USD cross-rate.
-  // A configured API key (Settings -> Jupiter API Key, starts with "jup")
-  // is sent as x-api-key; without one, requests are keyless and subject to
-  // a much lower rate limit that can start failing outright, silently
-  // falling back to the DexScreener path below.
   private async fetchPriceFromJupiter(tokenMint: string): Promise<number | null> {
-    if (Date.now() < this.jupiterCooldownUntil) return null;
-
-    try {
-      const apiKey = db.getSettings().jupiterApiKey?.trim();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
-      const res = await fetch(`${JUPITER_API_BASE}/price/v3?ids=${tokenMint},${SOL_MINT}`, {
-        signal: controller.signal,
-        headers: apiKey ? { 'x-api-key': apiKey } : undefined,
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
-        if (res.status === 429) {
-          this.handleJupiter429(res.status, `single fetch for ${tokenMint}`);
-        } else {
-          const body = await res.text().catch(() => '');
-          console.warn(`[Jupiter] price fetch failed for ${tokenMint}: HTTP ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
-        }
-        return null;
-      }
-
-      const data = await res.json();
-      const tokenUsd = parseFloat(data?.data?.[tokenMint]?.usdPrice ?? data?.[tokenMint]?.usdPrice);
-      if (!(tokenUsd > 0)) {
-        console.warn(`[Jupiter] price fetch for ${tokenMint} returned no usable price:`, JSON.stringify(data).slice(0, 200));
-        return null;
-      }
-
-      const solUsd = parseFloat(data?.data?.[SOL_MINT]?.usdPrice ?? data?.[SOL_MINT]?.usdPrice);
-      if (solUsd > 0) {
-        // Opportunistically keep the live SOL/USD rate fresh off the back
-        // of this call instead of only refreshing it on its own timer.
-        this.solPriceUsd = solUsd;
-        this.solPriceUpdatedAt = Date.now();
-      }
-      const priceSol = solUsd > 0 ? tokenUsd / solUsd : tokenUsd / this.getSolPriceUsd();
-      return priceSol > 0 ? priceSol : null;
-    } catch (err) {
-      console.warn(`[Jupiter] price fetch for ${tokenMint} threw:`, err instanceof Error ? err.message : err);
-      return null;
-    }
+    return jupiterCoordinator.getTokenPrice(tokenMint, JupiterPriority.LOW);
   }
 
-  // Fetches a real Jupiter swap quote for the exact trade size instead of
-  // just reading spot price. A real trade's fill price always reflects
-  // price impact from trading against actual pool depth at that size —
-  // spot price alone ignores that entirely, which is the main way paper
-  // execution used to diverge from what a real mirrored trade would get.
-  // Requires an API key (api.jup.ag's Free tier still requires one); when
-  // no key is configured or the request fails, callers should fall back to
-  // the spot-price + heuristic-slippage path.
   public async getExecutionQuote(
     inputMint: string,
     outputMint: string,
     amountRawUnits: number,
     slippageBps = 50
   ): Promise<{ outAmountRawUnits: number; priceImpactPct: number } | null> {
-    if (!(amountRawUnits > 0)) return null;
-    if (Date.now() < this.jupiterCooldownUntil) return null;
-    const apiKey = db.getSettings().jupiterApiKey?.trim();
-    if (!apiKey) {
-      console.warn('[Jupiter] getExecutionQuote skipped: no Jupiter API key configured in Settings');
-      return null;
-    }
-
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), PRICE_FETCH_TIMEOUT_MS);
-      const amount = Math.round(amountRawUnits).toString();
-      const url = `${JUPITER_API_BASE}/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { 'x-api-key': apiKey },
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
-        if (res.status === 429) {
-          this.handleJupiter429(res.status, 'execution quote');
-        } else {
-          const body = await res.text().catch(() => '');
-          console.warn(`[Jupiter] execution quote failed: HTTP ${res.status} ${res.statusText} ${body.slice(0, 300)}`);
-        }
-        return null;
-      }
-
-      const data = await res.json();
-      const outAmountRawUnits = parseFloat(data?.outAmount);
-      if (!(outAmountRawUnits > 0)) {
-        console.warn('[Jupiter] execution quote returned no usable outAmount:', JSON.stringify(data).slice(0, 200));
-        return null;
-      }
-      const priceImpactPct = parseFloat(data?.priceImpactPct) || 0;
-      return { outAmountRawUnits, priceImpactPct };
-    } catch (err) {
-      console.warn('[Jupiter] execution quote threw:', err instanceof Error ? err.message : err);
-      return null;
-    }
+    return jupiterCoordinator.getExecutionQuote(inputMint, outputMint, amountRawUnits, slippageBps);
   }
 
   private async fetchFromDexScreener(tokenMint: string): Promise<TokenInfo | null> {
